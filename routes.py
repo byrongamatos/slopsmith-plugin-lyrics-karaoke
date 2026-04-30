@@ -215,9 +215,11 @@ def _extract_pitch_per_syllable(vocals_path: Path, lyrics: list[dict]) -> list[d
         if median_hz <= 0:
             continue
         midi = int(round(69 + 12 * np.log2(median_hz / 440.0)))
+        # Keep `t` and `d` byte-identical to the lyric token so the
+        # frontend can match by exact value without a rounding dance.
         out.append({
-            "t": round(t0, 3),
-            "d": round(tok["d"], 3),
+            "t": t0,
+            "d": tok["d"],
             "midi": midi,
         })
     return out
@@ -316,12 +318,19 @@ def setup(app: FastAPI, context: dict):
 
     @app.get("/api/plugins/lyrics_karaoke/data")
     def lk_data(filename: str = ""):
-        """Bundle lyrics + pitch notes for the renderer in one fetch.
+        """Bundle lyrics + pitch into a single per-syllable list.
 
         The frontend caches this per song and only re-fetches on song
         change. PSARCs and sloppaks without pitch data return 404 so the
         frontend never speculatively turns on karaoke for an ineligible
         song.
+
+        Each entry in ``tokens`` is ``{t, d, w, midi?}`` — the ``midi``
+        field is present only for syllables where pitch extraction
+        produced a confidently-voiced result. Pre-merging on the server
+        avoids a brittle floating-point key match in the renderer (Python
+        and JS round half-cases differently, so a separate ``notes`` list
+        plus a ``t``-keyed lookup loses occasional bars).
         """
         resolved = _resolve_sloppak(filename)
         if resolved is None:
@@ -333,10 +342,27 @@ def setup(app: FastAPI, context: dict):
         notes = pitch.get("notes") if isinstance(pitch, dict) else None
         if not isinstance(notes, list):
             return JSONResponse({"error": "Malformed vocal_pitch.json"}, 500)
+
+        # Index pitch notes by exact serialized `t` so we don't depend on
+        # cross-language rounding semantics. The pitch writer keeps the
+        # lyric's `t` value verbatim (see _extract_pitch_per_syllable),
+        # so the source of truth is "the byte-identical float that came
+        # out of the lyrics list".
+        pitch_by_t: dict[str, int] = {}
+        for n in notes:
+            if isinstance(n, dict) and "t" in n and "midi" in n:
+                pitch_by_t[repr(float(n["t"]))] = int(n["midi"])
+
+        merged = []
+        for tok in _lyrics_tokens(source_dir, manifest):
+            entry = {"t": tok["t"], "d": tok["d"], "w": tok["w"]}
+            mid = pitch_by_t.get(repr(float(tok["t"])))
+            if mid is not None:
+                entry["midi"] = mid
+            merged.append(entry)
         return {
             "filename": filename,
-            "lyrics": _lyrics_tokens(source_dir, manifest),
-            "notes": notes,
+            "tokens": merged,
         }
 
     @app.post("/api/plugins/lyrics_karaoke/generate")

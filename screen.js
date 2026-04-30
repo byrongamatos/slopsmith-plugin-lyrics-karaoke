@@ -22,8 +22,7 @@
     // ── Per-song state ─────────────────────────────────────────────────
     let currentSong = null;          // {filename, format, ...} from window.slopsmith
     let status = null;               // last /status payload
-    let pitchData = null;            // {lyrics, notes} fetched lazily
-    let pitchByT = null;             // Map<rounded-t, midi> for O(1) lookup
+    let pitchData = null;            // {tokens: [{t, d, w, midi?}, ...]}
     let karaokeMode = false;         // user toggle
     let savedShowLyrics = true;      // restore on toggle off
     let generating = false;          // suppress double-clicks during /generate
@@ -52,6 +51,21 @@
     const BAR_PAD_PX = 2;
     const BAR_RADIUS = 4;
 
+    // Centralized class strings — every render path picks one of these so
+    // the disabled/enabled visual state always matches the .disabled flag.
+    // Spelled out as plain `opacity-*` / `cursor-not-allowed` rather than
+    // Tailwind's `disabled:` modifier prefix because the modifier only
+    // takes effect when the rule is in the class list AND the disabled
+    // attribute is set; rebuilding the class string per render is more
+    // predictable than relying on conditional Tailwind variants.
+    const BTN_CLASS_DISABLED =
+        'px-3 py-1.5 bg-dark-600 rounded-lg text-xs text-gray-500 transition ' +
+        'opacity-40 cursor-not-allowed';
+    const BTN_CLASS_PROMPT =
+        'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition';
+    const BTN_CLASS_ACTIVE =
+        'px-3 py-1.5 bg-yellow-900/40 hover:bg-yellow-900/60 rounded-lg text-xs text-yellow-200 transition';
+
     // ── Utilities ──────────────────────────────────────────────────────
 
     function safeFetch(url, opts) {
@@ -63,19 +77,6 @@
             try { body = text ? JSON.parse(text) : null; } catch (_) { body = { error: text }; }
             return { ok: r.ok, status: r.status, body };
         });
-    }
-
-    function buildPitchByT(notes) {
-        // Lyrics tokens and pitch notes are aligned by `t` (the lyric's
-        // start time). The backend rounds both sides to 3 decimals before
-        // writing, so an exact key match lines them up reliably.
-        const map = new Map();
-        if (!Array.isArray(notes)) return map;
-        for (const n of notes) {
-            if (!n || typeof n.t !== 'number') continue;
-            map.set(n.t.toFixed(3), n.midi);
-        }
-        return map;
     }
 
     function syllableText(s) {
@@ -111,7 +112,6 @@
         if (token !== inflightFetch) return null;
         if (!res.ok) return null;
         pitchData = res.body;
-        pitchByT = buildPitchByT(pitchData && pitchData.notes);
         return pitchData;
     }
 
@@ -124,9 +124,11 @@
         toggleBtn = document.createElement('button');
         toggleBtn.id = 'btn-karaoke';
         toggleBtn.type = 'button';
-        toggleBtn.className =
-            'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 ' +
-            'transition disabled:opacity-40 disabled:cursor-not-allowed';
+        // Disabled styling on creation; refreshButtonState() rewrites
+        // className on every state transition so the visual stays in
+        // sync with the .disabled flag.
+        toggleBtn.disabled = true;
+        toggleBtn.className = BTN_CLASS_DISABLED;
         toggleBtn.textContent = 'Karaoke';
         toggleBtn.title = 'Karaoke pitch view (sloppak only)';
         toggleBtn.addEventListener('click', onToggleClick);
@@ -146,6 +148,7 @@
 
         if (generating) {
             toggleBtn.disabled = true;
+            toggleBtn.className = BTN_CLASS_DISABLED;
             toggleBtn.textContent = 'Generating…';
             toggleBtn.title = 'Extracting vocal pitch — this can take a minute.';
             return;
@@ -153,6 +156,7 @@
 
         if (!status) {
             toggleBtn.disabled = true;
+            toggleBtn.className = BTN_CLASS_DISABLED;
             toggleBtn.textContent = 'Karaoke';
             toggleBtn.title = 'Checking…';
             return;
@@ -160,6 +164,7 @@
 
         if (!status.has_lyrics) {
             toggleBtn.disabled = true;
+            toggleBtn.className = BTN_CLASS_DISABLED;
             toggleBtn.textContent = 'Karaoke';
             toggleBtn.title = 'Karaoke needs synced lyrics. Run Lyrics Sync first.';
             return;
@@ -167,6 +172,7 @@
 
         if (!status.has_vocals) {
             toggleBtn.disabled = true;
+            toggleBtn.className = BTN_CLASS_DISABLED;
             toggleBtn.textContent = 'Karaoke';
             toggleBtn.title = 'Karaoke needs an isolated vocals stem. Split stems with Demucs first.';
             return;
@@ -174,6 +180,7 @@
 
         if (!status.has_pitch) {
             toggleBtn.disabled = false;
+            toggleBtn.className = BTN_CLASS_PROMPT;
             toggleBtn.textContent = 'Generate Karaoke';
             toggleBtn.title = 'Extract per-syllable pitch from the vocals stem.';
             return;
@@ -181,23 +188,19 @@
 
         // Karaoke ready — toggle between text and karaoke modes.
         toggleBtn.disabled = false;
-        if (karaokeMode) {
-            toggleBtn.textContent = 'Karaoke ✓';
-            toggleBtn.className =
-                'px-3 py-1.5 bg-yellow-900/40 hover:bg-yellow-900/60 rounded-lg text-xs ' +
-                'text-yellow-200 transition';
-        } else {
-            toggleBtn.textContent = 'Karaoke';
-            toggleBtn.className =
-                'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs ' +
-                'text-gray-300 transition';
-        }
+        toggleBtn.className = karaokeMode ? BTN_CLASS_ACTIVE : BTN_CLASS_PROMPT;
+        toggleBtn.textContent = karaokeMode ? 'Karaoke ✓' : 'Karaoke';
         toggleBtn.title = 'Switch between text lyrics and karaoke pitch ribbon.';
     }
 
     async function onToggleClick() {
         if (!currentSong || !status || generating) return;
         if (!status.has_lyrics || !status.has_vocals) return;
+
+        // Pin the filename at click time. If the user changes songs
+        // mid-generation, we don't want to apply the result to a
+        // different song's state.
+        const clickFilename = currentSong.filename;
 
         if (!status.has_pitch) {
             // Generate path
@@ -207,22 +210,33 @@
                 const res = await safeFetch('/api/plugins/lyrics_karaoke/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ filename: currentSong.filename }),
+                    body: JSON.stringify({ filename: clickFilename }),
                 });
+                if (currentSong && currentSong.filename !== clickFilename) {
+                    // Song changed while we were waiting — let the
+                    // caller's resetForNewSong path own state. The new
+                    // song's onSongLoaded already kicked off its own
+                    // status fetch; we'd just clobber it otherwise.
+                    return;
+                }
                 if (!res.ok) {
                     const msg = (res.body && res.body.error) || `Failed (${res.status})`;
                     alert('Karaoke generation failed: ' + msg);
                 } else {
                     // Refresh status, then auto-enable karaoke mode
-                    await fetchStatus(currentSong.filename);
+                    await fetchStatus(clickFilename);
+                    if (currentSong && currentSong.filename !== clickFilename) return;
                     if (status && status.has_pitch) {
-                        await fetchPitchData(currentSong.filename);
+                        await fetchPitchData(clickFilename);
+                        if (currentSong && currentSong.filename !== clickFilename) return;
                         setKaraokeMode(true);
                     }
                 }
             } finally {
                 generating = false;
-                refreshButtonState();
+                if (currentSong && currentSong.filename === clickFilename) {
+                    refreshButtonState();
+                }
             }
             return;
         }
@@ -232,7 +246,8 @@
             setKaraokeMode(false);
         } else {
             if (!pitchData) {
-                await fetchPitchData(currentSong.filename);
+                await fetchPitchData(clickFilename);
+                if (currentSong && currentSong.filename !== clickFilename) return;
             }
             setKaraokeMode(!!pitchData);
         }
@@ -364,17 +379,20 @@
         // Use the absolute window [now - playhead-frac * VISIBLE_SECONDS,
         // now + (1-frac) * VISIBLE_SECONDS]. A small overscan on either
         // side keeps bars from popping at the edges.
-        if (!pitchData || !Array.isArray(pitchData.lyrics)) return [];
+        if (!pitchData || !Array.isArray(pitchData.tokens)) return [];
         const winLeft = now - PLAYHEAD_FRAC * VISIBLE_SECONDS - 0.5;
         const winRight = now + (1 - PLAYHEAD_FRAC) * VISIBLE_SECONDS + 0.5;
         const out = [];
-        for (const tok of pitchData.lyrics) {
+        for (const tok of pitchData.tokens) {
             if (!tok || typeof tok.t !== 'number') continue;
+            // Skip syllables that lacked confident voicing — the backend
+            // omits `midi` for those. The text strip below the bars also
+            // omits them so the visual stays a clean ribbon rather than
+            // gappy blocks of orphan text.
+            if (typeof tok.midi !== 'number') continue;
             const t1 = tok.t + (tok.d || 0);
             if (t1 < winLeft || tok.t > winRight) continue;
-            const midi = pitchByT && pitchByT.get(tok.t.toFixed(3));
-            if (typeof midi !== 'number') continue;  // unvoiced syllable, skip the bar
-            out.push({ tok, midi });
+            out.push({ tok, midi: tok.midi });
         }
         return out;
     }
@@ -383,7 +401,7 @@
         // Auto-fit the strip to the local vocal range, but never collapse
         // tighter than MIN_PITCH_SPAN_SEMITONES so a held single note still
         // sits in the middle of the strip rather than filling it.
-        if (!visible.length) return { lo: 60, hi: 72 };
+        if (!visible.length) return { lo: 60, hi: 60 + MIN_PITCH_SPAN_SEMITONES };
         let lo = Infinity, hi = -Infinity;
         for (const v of visible) {
             if (v.midi < lo) lo = v.midi;
@@ -498,19 +516,24 @@
     // ── Song lifecycle wiring ──────────────────────────────────────────
 
     function resetForNewSong(song) {
+        // If the previous song had karaoke mode on, the highway's
+        // showLyrics flag is currently forced to false. Restore the
+        // user's saved preference BEFORE we lose track of it — the
+        // highway carries showLyrics across songs (it lives in factory
+        // closure state and is only reset by toggleLyrics()), so
+        // forgetting to restore here would leave text lyrics hidden on
+        // the next song that doesn't support karaoke.
+        if (karaokeMode) {
+            if (window.highway && typeof window.highway.setLyricsVisible === 'function') {
+                window.highway.setLyricsVisible(savedShowLyrics);
+            }
+            karaokeMode = false;
+        }
         currentSong = song || null;
         status = null;
         pitchData = null;
-        pitchByT = null;
         // Tear the overlay all the way down so a previous song's bars
         // don't briefly flash for the new song before its data arrives.
-        if (karaokeMode) {
-            karaokeMode = false;
-            // Don't restore showLyrics here — we never touched it for the
-            // new song yet. The previous song's restore happened in the
-            // setKaraokeMode(false) path on song change OR is moot
-            // because the highway resets anyway.
-        }
         teardownOverlay();
         refreshButtonState();
     }
@@ -531,7 +554,17 @@
     function init() {
         ensureToggleButton();
         if (window.slopsmith && typeof window.slopsmith.on === 'function') {
-            window.slopsmith.on('song:loaded', onSongLoaded);
+            // window.slopsmith is an EventTarget; .on() forwards to
+            // addEventListener, so the handler receives a CustomEvent
+            // whose `.detail` is the actual payload (the song info).
+            window.slopsmith.on('song:loaded', (e) => onSongLoaded(e && e.detail));
+            // Catch-up: plugin scripts load after app.js, so the very
+            // first `song:loaded` may have already fired by the time
+            // this listener attaches. Read the cached currentSong as a
+            // fallback. Subsequent songs go through the listener.
+            if (window.slopsmith.currentSong) {
+                onSongLoaded(window.slopsmith.currentSong);
+            }
         }
         // showScreen wrapper — clean up when leaving the player.
         const origShowScreen = window.showScreen;
