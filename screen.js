@@ -1,18 +1,24 @@
 /**
  * Lyrics Karaoke plugin — front-end.
  *
- * Adds a "Karaoke" button to the player controls that, when active,
- * replaces the highway's text-lyrics overlay with a horizontal pitch
- * ribbon: one bar per syllable, vertically positioned by the syllable's
- * MIDI pitch, with the syllable text rendered directly below the bar.
- * A vertical playhead sweeps across in time with playback, and the
- * portion of any bar to the left of the playhead is filled in a
- * brighter color so the singer sees what they're "supposed to be"
- * singing right now.
+ * Two responsibilities, one IIFE:
  *
- * Backend gating — only sloppak songs with a vocals stem AND synced
- * lyrics are eligible. PSARC songs and lyrics-only sloppaks have the
- * button hidden / disabled with a tooltip explaining why.
+ *  1. **Setup screen** ("Lyrics Karaoke" in the nav). A wizard that
+ *     picks a song, shows what's missing (vocals stem / synced lyrics /
+ *     pitch contour), and runs whatever stages are needed to make the
+ *     song karaoke-ready. The setup-screen entry points are exposed on
+ *     `window.lk*` because screen.html uses inline `onclick=` handlers.
+ *
+ *  2. **In-player overlay**. When the user opens a sloppak song with
+ *     pitch data and toggles "Karaoke" in the player controls, we draw
+ *     a horizontal pitch ribbon (one bar per syllable, vertically
+ *     positioned by MIDI pitch, with syllable text below and a sweeping
+ *     playhead) on a fixed-position canvas above the highway.
+ *
+ * The merge consumes the previous standalone "Lyrics Sync" plugin —
+ * its alignment + save endpoints now live on this plugin. The old
+ * lyrics_sync directory remains as a redirect stub for users with
+ * bookmarks pointing at it.
  */
 (function () {
     'use strict';
@@ -551,6 +557,518 @@
         refreshButtonState();
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // SETUP SCREEN — wizard for "Add karaoke to this song"
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // The setup screen DOM is in screen.html. The functions below are
+    // exposed on window.lk* because screen.html uses inline onclick=
+    // attributes (innerHTML-injected screens can't hydrate via
+    // addEventListener at parse time — that's a Slopsmith convention,
+    // not a personal preference).
+
+    const setup = {
+        selectedFilename: null,
+        selectedTitle: '',
+        selectedArtist: '',
+        // Last alignment result (returned by /align). Held in memory
+        // until the build pipeline auto-saves or the user discards.
+        alignmentResult: null,
+        // Last status fetch for the SETUP screen — kept separate from
+        // the player overlay's `status` so a song change in the player
+        // doesn't blow away setup state mid-build.
+        status: null,
+    };
+
+    function setupEl(id) { return document.getElementById(id); }
+
+    async function refreshServerStatus() {
+        const el = setupEl('lk-server-status');
+        if (!el) return;
+        try {
+            const res = await safeFetch('/api/plugins/lyrics_karaoke/server-status');
+            const ok = res.ok && res.body && res.body.available;
+            if (ok) {
+                el.innerHTML =
+                    '<div class="bg-green-900/20 border border-green-800/30 rounded-xl p-3 text-sm">' +
+                    '<span class="text-green-400">Alignment server ready</span>' +
+                    '</div>';
+            } else {
+                const reason = (res.body && res.body.reason) || 'Unknown error';
+                el.innerHTML =
+                    '<div class="bg-yellow-900/20 border border-yellow-800/30 rounded-xl p-4 text-sm">' +
+                    '<p class="text-yellow-400 font-semibold mb-1">Alignment server unavailable</p>' +
+                    '<p class="text-gray-400">' + escHtml(reason) + '</p>' +
+                    '<p class="text-gray-500 mt-1">Set <code>demucs_server_url</code> in Stems / Sloppak Converter settings.</p>' +
+                    '</div>';
+            }
+        } catch (_) {
+            el.innerHTML =
+                '<div class="bg-red-900/20 border border-red-800/30 rounded-xl p-3 text-sm">' +
+                '<span class="text-red-400">Failed to check alignment server</span>' +
+                '</div>';
+        }
+    }
+
+    function escHtml(s) {
+        // Local minimal HTML escape — keeps the plugin's setup-screen
+        // markup safe even if app.js's global esc() helper is missing.
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    async function lkSearchSongs() {
+        const input = setupEl('lk-search');
+        const q = (input && input.value || '').trim();
+        const container = setupEl('lk-search-results');
+        if (!container) return;
+        if (!q) {
+            container.innerHTML = '';
+            return;
+        }
+        const url = `/api/library?q=${encodeURIComponent(q)}&page=0&size=20&sort=artist&format=sloppak`;
+        const res = await safeFetch(url);
+        if (!res.ok) {
+            container.innerHTML = '<p class="text-gray-500 text-xs py-2">Search failed.</p>';
+            return;
+        }
+        const songs = (res.body && res.body.songs) || [];
+        // Karaoke needs split stems (vocals.ogg). The library returns
+        // stem_count; >1 means Demucs has run on this song. Songs with
+        // only `full.ogg` aren't useful here — surface a hint instead
+        // of silently dropping them.
+        const withStems = songs.filter((s) => (s.stem_count || 0) > 1);
+        const withoutStems = songs.length - withStems.length;
+        if (!withStems.length) {
+            container.innerHTML =
+                '<p class="text-gray-500 text-xs py-2">' +
+                'No sloppak songs with split stems matched. ' +
+                'Run Demucs split (Stems plugin / Sloppak Converter) on a song first.' +
+                (withoutStems > 0 ? ` (${withoutStems} matched without stems.)` : '') +
+                '</p>';
+            return;
+        }
+        container.innerHTML = withStems.map((s) => {
+            const fn = encodeURIComponent(s.filename);
+            const title = escHtml(s.title);
+            const artist = escHtml(s.artist);
+            // Stash the raw values on data attributes so the click
+            // handler can read them without the brittle inline-string
+            // escape dance the old lyrics_sync plugin used.
+            return (
+                '<div class="flex items-center gap-3 py-2 px-3 rounded-lg hover:bg-dark-700/50 transition cursor-pointer" ' +
+                'data-fn="' + fn + '" data-title="' + title + '" data-artist="' + artist + '" ' +
+                'onclick="lkSelectFromResult(this)">' +
+                '  <div class="flex-1 min-w-0">' +
+                '    <span class="text-sm text-white">' + title + '</span> ' +
+                '    <span class="text-xs text-gray-500 ml-2">' + artist + '</span>' +
+                '  </div>' +
+                '  <span class="text-xs text-gray-600">' + (s.stem_count | 0) + ' stems</span>' +
+                '</div>'
+            );
+        }).join('');
+    }
+
+    function lkSelectFromResult(div) {
+        if (!div) return;
+        const fn = decodeURIComponent(div.getAttribute('data-fn') || '');
+        const title = div.getAttribute('data-title') || '';
+        const artist = div.getAttribute('data-artist') || '';
+        lkSelectSong(fn, title, artist);
+    }
+
+    async function lkSelectSong(filename, title, artist) {
+        setup.selectedFilename = filename;
+        setup.selectedTitle = title;
+        setup.selectedArtist = artist;
+        setup.alignmentResult = null;
+        const results = setupEl('lk-search-results');
+        if (results) results.innerHTML = '';
+        const search = setupEl('lk-search');
+        if (search) search.value = '';
+        const sel = setupEl('lk-selected-song');
+        const lbl = setupEl('lk-selected-label');
+        if (sel) sel.classList.remove('hidden');
+        if (lbl) lbl.textContent = `${title} — ${artist}`;
+        await refreshSetupStatus();
+    }
+
+    function lkClearSong() {
+        setup.selectedFilename = null;
+        setup.selectedTitle = '';
+        setup.selectedArtist = '';
+        setup.alignmentResult = null;
+        setup.status = null;
+        const sel = setupEl('lk-selected-song');
+        const lbl = setupEl('lk-selected-label');
+        if (sel) sel.classList.add('hidden');
+        if (lbl) lbl.textContent = '';
+        // Hide all the per-song sections.
+        for (const id of ['lk-checklist-section', 'lk-lyrics-section', 'lk-build-section', 'lk-done', 'lk-progress', 'lk-error']) {
+            const el = setupEl(id);
+            if (el) el.classList.add('hidden');
+        }
+    }
+
+    async function refreshSetupStatus() {
+        if (!setup.selectedFilename) return;
+        const url = `/api/plugins/lyrics_karaoke/status?filename=${encodeURIComponent(setup.selectedFilename)}`;
+        const res = await safeFetch(url);
+        if (!res.ok) return;
+        // Pinned to selectedFilename — refreshSetupStatus is called from
+        // synchronous flows (selectSong, post-build), so a song-change
+        // race would manifest as a stale status. Cheap to guard.
+        if (!res.body || res.body.filename !== setup.selectedFilename) return;
+        setup.status = res.body;
+        renderSetupStatus();
+    }
+
+    function renderSetupStatus() {
+        const s = setup.status;
+        if (!s) return;
+        const checklist = setupEl('lk-checklist');
+        const checklistSection = setupEl('lk-checklist-section');
+        if (checklistSection) checklistSection.classList.remove('hidden');
+
+        // Update the three checklist rows by data-key.
+        function setRow(key, mark, klass, detail) {
+            if (!checklist) return;
+            const row = checklist.querySelector(`li[data-key="${key}"]`);
+            if (!row) return;
+            const check = row.querySelector('.lk-check');
+            const det = row.querySelector('.lk-detail');
+            if (check) {
+                check.textContent = mark;
+                check.className = 'lk-check w-5 ' + klass;
+            }
+            if (det) det.textContent = detail || '';
+        }
+
+        if (s.has_vocals) {
+            setRow('vocals', '✓', 'text-green-400', 'stems/vocals.ogg');
+        } else {
+            setRow('vocals', '✗', 'text-red-400', 'Run Demucs split first');
+        }
+
+        if (s.has_lyrics) {
+            setRow('lyrics', '✓', 'text-green-400', 'lyrics.json present');
+        } else {
+            setRow('lyrics', '✗', 'text-yellow-400', 'Paste plain text below');
+        }
+
+        if (s.has_pitch) {
+            setRow('pitch', '✓', 'text-green-400', `${s.pitch_count} voiced syllables`);
+        } else if (!s.has_lyrics) {
+            setRow('pitch', '⏸', 'text-gray-500', 'Waiting for synced lyrics');
+        } else {
+            setRow('pitch', '✗', 'text-yellow-400', 'Will extract on Build');
+        }
+
+        // Lyrics input section — show only when synced lyrics are missing
+        // AND vocals exist (no point pasting text without a stem to align).
+        const lyricsSection = setupEl('lk-lyrics-section');
+        if (lyricsSection) {
+            if (!s.has_lyrics && s.has_vocals) {
+                lyricsSection.classList.remove('hidden');
+            } else {
+                lyricsSection.classList.add('hidden');
+            }
+        }
+
+        // Build section — visible if vocals exist and either lyrics need
+        // aligning or pitch needs extracting. Hidden when there's
+        // genuinely nothing to do (everything ready) — that surface goes
+        // to the done state instead.
+        const buildSection = setupEl('lk-build-section');
+        const doneSection = setupEl('lk-done');
+        if (s.has_vocals && (!s.has_lyrics || !s.has_pitch)) {
+            if (buildSection) buildSection.classList.remove('hidden');
+            if (doneSection) doneSection.classList.add('hidden');
+        } else if (s.has_vocals && s.has_lyrics && s.has_pitch) {
+            if (buildSection) buildSection.classList.add('hidden');
+            renderDoneState(s);
+        } else {
+            // No vocals — neither section is actionable.
+            if (buildSection) buildSection.classList.add('hidden');
+            if (doneSection) doneSection.classList.add('hidden');
+        }
+
+        updateBuildBtn();
+    }
+
+    function renderDoneState(s) {
+        const doneSection = setupEl('lk-done');
+        const detail = setupEl('lk-done-detail');
+        if (doneSection) doneSection.classList.remove('hidden');
+        if (detail) {
+            detail.textContent =
+                `${setup.selectedArtist} — ${setup.selectedTitle} has lyrics + pitch persisted` +
+                ` (${s.pitch_count || 0} voiced syllables). Open in the player and toggle Karaoke.`;
+        }
+        // Only offer the .lrc download if we have a fresh alignment
+        // result in memory — re-loading from disk would lose word/line
+        // boundaries that the export format expects.
+        const exportBtn = setupEl('lk-export-btn');
+        if (exportBtn) {
+            if (setup.alignmentResult && setup.alignmentResult.length) {
+                exportBtn.classList.remove('hidden');
+            } else {
+                exportBtn.classList.add('hidden');
+            }
+        }
+    }
+
+    function updateBuildBtn() {
+        const btn = setupEl('lk-build-btn');
+        if (!btn) return;
+        const s = setup.status;
+        if (!s || !setup.selectedFilename || !s.has_vocals) {
+            btn.disabled = true;
+            return;
+        }
+        // If lyrics are missing, we need pasted text to align. If lyrics
+        // are present (only pitch missing), we can build with no input.
+        if (!s.has_lyrics) {
+            const ta = setupEl('lk-lyrics');
+            const has = ta && ta.value.trim().length > 0;
+            btn.disabled = !has;
+            btn.textContent = 'Build Karaoke';
+        } else if (!s.has_pitch) {
+            btn.disabled = false;
+            btn.textContent = 'Extract pitch';
+        } else {
+            btn.disabled = true;
+            btn.textContent = 'Karaoke ready';
+        }
+    }
+
+    function lkFileUpload(input) {
+        const file = input && input.files && input.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            const ta = setupEl('lk-lyrics');
+            if (ta) ta.value = String(reader.result || '');
+            lkUpdateLineCount();
+            updateBuildBtn();
+        };
+        reader.readAsText(file);
+        input.value = '';
+    }
+
+    function lkUpdateLineCount() {
+        const ta = setupEl('lk-lyrics');
+        const out = setupEl('lk-lyrics-count');
+        const text = ta ? ta.value.trim() : '';
+        const count = text ? text.split('\n').filter((l) => l.trim()).length : 0;
+        if (out) out.textContent = `${count} line${count !== 1 ? 's' : ''}`;
+    }
+
+    function setupGranularity() {
+        const checked = document.querySelector('input[name="lk-granularity"]:checked');
+        return checked ? checked.value : 'syllable';
+    }
+
+    function showProgress(label, detail) {
+        const p = setupEl('lk-progress');
+        const lbl = setupEl('lk-progress-label');
+        const det = setupEl('lk-progress-detail');
+        if (p) p.classList.remove('hidden');
+        if (lbl) lbl.textContent = label || 'Working…';
+        if (det) det.textContent = detail || '';
+        const err = setupEl('lk-error');
+        if (err) err.classList.add('hidden');
+    }
+
+    function hideProgress() {
+        const p = setupEl('lk-progress');
+        if (p) p.classList.add('hidden');
+    }
+
+    function showError(msg) {
+        hideProgress();
+        const err = setupEl('lk-error');
+        const det = setupEl('lk-error-detail');
+        if (err) err.classList.remove('hidden');
+        if (det) det.textContent = msg || 'Unknown error';
+    }
+
+    async function lkBuild() {
+        if (!setup.selectedFilename || !setup.status) return;
+        const filename = setup.selectedFilename;
+        const btn = setupEl('lk-build-btn');
+        if (btn) btn.disabled = true;
+
+        try {
+            // Step 1 — align lyrics if missing.
+            if (!setup.status.has_lyrics) {
+                const ta = setupEl('lk-lyrics');
+                const text = ta ? ta.value.trim() : '';
+                if (!text) { showError('Paste lyrics text first.'); return; }
+                showProgress('Aligning lyrics with Whisper…', 'This can take a minute on the alignment server.');
+                const lang = (setupEl('lk-language') || {}).value || '';
+                const granularity = setupGranularity();
+                const alignRes = await safeFetch('/api/plugins/lyrics_karaoke/align', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        filename,
+                        lyrics_text: text,
+                        language: lang || undefined,
+                        granularity,
+                    }),
+                });
+                if (filename !== setup.selectedFilename) return;
+                if (!alignRes.ok || !alignRes.body || !Array.isArray(alignRes.body.segments)) {
+                    showError((alignRes.body && alignRes.body.error) || `Alignment failed (${alignRes.status})`);
+                    return;
+                }
+                setup.alignmentResult = alignRes.body.segments;
+
+                showProgress('Saving aligned lyrics…');
+                const saveRes = await safeFetch('/api/plugins/lyrics_karaoke/save-lyrics', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename, segments: setup.alignmentResult }),
+                });
+                if (filename !== setup.selectedFilename) return;
+                if (!saveRes.ok) {
+                    showError((saveRes.body && saveRes.body.error) || `Save failed (${saveRes.status})`);
+                    return;
+                }
+            }
+
+            // Step 2 — extract pitch (always do this; status flag may be
+            // stale after step 1 wrote new lyrics).
+            showProgress('Extracting per-syllable pitch with pYIN…', 'Reading the vocals stem; ~30s for a 4-min song.');
+            const pitchRes = await safeFetch('/api/plugins/lyrics_karaoke/generate-pitch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename }),
+            });
+            if (filename !== setup.selectedFilename) return;
+            if (!pitchRes.ok) {
+                showError((pitchRes.body && pitchRes.body.error) || `Pitch extraction failed (${pitchRes.status})`);
+                return;
+            }
+
+            // Refresh status and render the done state.
+            hideProgress();
+            await refreshSetupStatus();
+            // Also refresh the player overlay's cached status for this
+            // song so the in-player toggle picks up the new pitch data
+            // immediately if the user navigates straight to playback.
+            if (currentSong && currentSong.filename === filename) {
+                await fetchStatus(filename);
+                refreshButtonState();
+            }
+        } catch (e) {
+            showError(e && e.message ? e.message : String(e));
+        } finally {
+            if (btn) btn.disabled = false;
+            updateBuildBtn();
+        }
+    }
+
+    async function lkRedoPitch() {
+        if (!setup.selectedFilename) return;
+        const filename = setup.selectedFilename;
+        showProgress('Re-extracting per-syllable pitch…');
+        const res = await safeFetch('/api/plugins/lyrics_karaoke/generate-pitch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename }),
+        });
+        if (filename !== setup.selectedFilename) return;
+        if (!res.ok) {
+            showError((res.body && res.body.error) || `Pitch extraction failed (${res.status})`);
+            return;
+        }
+        hideProgress();
+        await refreshSetupStatus();
+        if (currentSong && currentSong.filename === filename) {
+            pitchData = null;  // force the player overlay to refetch on toggle
+            await fetchStatus(filename);
+            refreshButtonState();
+        }
+    }
+
+    async function lkExport() {
+        if (!setup.alignmentResult || !setup.alignmentResult.length) return;
+        const res = await fetch('/api/plugins/lyrics_karaoke/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                segments: setup.alignmentResult,
+                title: setup.selectedTitle,
+                artist: setup.selectedArtist,
+            }),
+        });
+        if (!res.ok) return;
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const disposition = res.headers.get('Content-Disposition') || '';
+        const match = disposition.match(/filename="(.+)"/);
+        a.download = match ? match[1] : 'lyrics.lrc';
+        a.href = url;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+    }
+
+    function lkOpenInPlayer() {
+        if (!setup.selectedFilename) return;
+        if (typeof window.playSong === 'function') {
+            window.playSong(setup.selectedFilename);
+        } else if (typeof window.showScreen === 'function') {
+            window.showScreen('player');
+        }
+    }
+
+    // Bind input listeners after the screen is injected. The setup
+    // screen's <textarea> isn't in the DOM at script-load time (it's
+    // added when loadPlugins() injects the screen HTML), so attach
+    // lazily on first showScreen('plugin-lyrics_karaoke').
+    let setupHydrated = false;
+    function hydrateSetupScreen() {
+        if (setupHydrated) return;
+        const ta = setupEl('lk-lyrics');
+        if (!ta) return;  // screen not in DOM yet
+        ta.addEventListener('input', () => { lkUpdateLineCount(); updateBuildBtn(); });
+        setupHydrated = true;
+    }
+
+    function onSetupScreenShown() {
+        hydrateSetupScreen();
+        refreshServerStatus();
+        // Don't auto-clear selection — users who drilled into a song
+        // and back-buttoned to the screen expect their selection to
+        // persist.
+        if (setup.selectedFilename) {
+            refreshSetupStatus();
+        }
+    }
+
+    // Expose setup-screen API for inline onclick= handlers.
+    window.lkSearchSongs = lkSearchSongs;
+    window.lkSelectFromResult = lkSelectFromResult;
+    window.lkClearSong = lkClearSong;
+    window.lkBuild = lkBuild;
+    window.lkRedoPitch = lkRedoPitch;
+    window.lkExport = lkExport;
+    window.lkOpenInPlayer = lkOpenInPlayer;
+    window.lkFileUpload = lkFileUpload;
+
+    // ══════════════════════════════════════════════════════════════════
+    // INIT
+    // ══════════════════════════════════════════════════════════════════
+
     function init() {
         ensureToggleButton();
         if (window.slopsmith && typeof window.slopsmith.on === 'function') {
@@ -566,7 +1084,10 @@
                 onSongLoaded(window.slopsmith.currentSong);
             }
         }
-        // showScreen wrapper — clean up when leaving the player.
+        // showScreen wrapper — clean up overlays when leaving the player,
+        // and hydrate the setup screen when entering it. Keep the
+        // wrapper minimal so we play nice with other plugins that also
+        // hook showScreen (load order isn't deterministic).
         const origShowScreen = window.showScreen;
         if (typeof origShowScreen === 'function') {
             window.showScreen = function (name) {
@@ -574,6 +1095,9 @@
                 if (name !== 'player') {
                     if (karaokeMode) setKaraokeMode(false);
                     teardownOverlay();
+                }
+                if (name === 'plugin-lyrics_karaoke') {
+                    onSetupScreenShown();
                 }
                 return ret;
             };

@@ -1,16 +1,28 @@
-"""Lyrics Karaoke plugin — generate per-syllable vocal pitch from a sloppak's
-vocals stem so the lyrics panel can render a karaoke-style pitch ribbon.
+"""Lyrics Karaoke plugin — end-to-end karaoke setup for sloppak songs.
 
-Pitch extraction uses ``librosa.pyin`` (monophonic, voicing-aware). For each
-lyric token (t, d), we take the median MIDI pitch over voiced frames inside
-the token's time window and snap to the nearest semitone. Tokens with no
-confidently-voiced frames are dropped from the output.
+Two stages, one workflow:
 
-The result is written to ``vocal_pitch.json`` next to the lyrics inside the
-sloppak, and ``manifest.yaml`` is patched to point at it. For zip-form
-sloppaks the cached source dir is the authoritative working copy; we re-zip
-it back over the original (with a one-time ``.bak`` fallback) so the change
-ships with the file.
+1. **Sync lyrics** — send a sloppak's vocals stem + plain lyric text to a
+   Whisper alignment service (the demucs server's ``/align`` endpoint) and
+   write the syllable-level result to ``lyrics.json`` inside the sloppak.
+2. **Extract pitch** — run ``librosa.pyin`` over the same vocals stem,
+   median per syllable, and write ``vocal_pitch.json`` next to it.
+
+Both artifacts are persisted inside the sloppak (manifest is patched, zip
+form is re-zipped with a one-time ``.bak``). The frontend can run them
+in sequence as a single "Build Karaoke" action, or independently when
+one of the two artifacts already exists.
+
+Endpoints
+---------
+
+* ``GET  /status?filename=…``     — per-song readiness flags
+* ``GET  /server-status``         — alignment server reachable?
+* ``GET  /data?filename=…``       — merged ``[{t, d, w, midi?}]`` for the player overlay
+* ``POST /align``                 — run Whisper alignment, return segments
+* ``POST /save-lyrics``           — persist alignment segments as ``lyrics.json``
+* ``POST /generate-pitch``        — extract per-syllable pitch and persist ``vocal_pitch.json``
+* ``POST /export``                — download alignment as a standard ``.lrc`` file
 """
 
 from __future__ import annotations
@@ -26,7 +38,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 
 _config_dir: Path | None = None
@@ -37,6 +49,29 @@ SLOPPAK_CACHE_DIR: Path | None = None
 # same song serialize instead of racing on the same files.
 _job_locks: dict[str, threading.Lock] = {}
 _job_locks_guard = threading.Lock()
+
+
+# ── Demucs / alignment server config ──────────────────────────────────────────
+
+def _get_demucs_server_url() -> str | None:
+    """Read the configured alignment server URL from the shared config.json.
+
+    The Stems / Lyrics Sync settings page persists this; the merged plugin
+    keeps the same key so existing setups keep working without migration.
+    """
+    if _config_dir is None:
+        return None
+    config_file = _config_dir / "config.json"
+    if not config_file.exists():
+        return None
+    try:
+        cfg = json.loads(config_file.read_text())
+    except Exception:
+        return None
+    url = cfg.get("demucs_server_url", "")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    return url.rstrip("/")
 
 
 # ── Manifest helpers ──────────────────────────────────────────────────────────
@@ -225,7 +260,7 @@ def _extract_pitch_per_syllable(vocals_path: Path, lyrics: list[dict]) -> list[d
     return out
 
 
-# ── Persistence: write vocal_pitch.json + patch manifest + re-zip ─────────────
+# ── Persistence: write JSON + patch manifest + re-zip ─────────────────────────
 
 def _rezip_sloppak(source_dir: Path, output_path: Path) -> None:
     """Replace the zip-form sloppak with the contents of source_dir.
@@ -249,6 +284,52 @@ def _rezip_sloppak(source_dir: Path, output_path: Path) -> None:
     tmp_zip.replace(output_path)
 
 
+def _atomic_write_json(path: Path, payload) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _persist_lyrics(
+    source_dir: Path,
+    manifest: dict,
+    segments: list[dict],
+    dlc_path: Path,
+    is_zip: bool,
+) -> int:
+    """Convert alignment segments to the sloppak lyrics format and persist.
+
+    Returns the number of lyric entries written.
+    """
+    lyrics_data = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            start = float(seg["start"])
+            end = float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        d = end - start
+        if d <= 0:
+            continue
+        lyrics_data.append({
+            "t": round(start, 3),
+            "d": round(d, 3),
+            "w": str(seg.get("text", "")),
+        })
+
+    _atomic_write_json(source_dir / "lyrics.json", lyrics_data)
+
+    if manifest.get("lyrics") != "lyrics.json":
+        manifest["lyrics"] = "lyrics.json"
+        _write_manifest(source_dir, manifest)
+
+    if is_zip:
+        _rezip_sloppak(source_dir, dlc_path)
+    return len(lyrics_data)
+
+
 def _persist_pitch(
     source_dir: Path,
     manifest: dict,
@@ -257,11 +338,7 @@ def _persist_pitch(
     is_zip: bool,
 ) -> None:
     pitch_payload = {"version": 1, "notes": notes}
-    pitch_path = source_dir / "vocal_pitch.json"
-    # Atomic write so a partial dump can't poison the cache dir.
-    tmp = pitch_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(pitch_payload, indent=2), encoding="utf-8")
-    tmp.replace(pitch_path)
+    _atomic_write_json(source_dir / "vocal_pitch.json", pitch_payload)
 
     if manifest.get("vocal_pitch") != "vocal_pitch.json":
         manifest["vocal_pitch"] = "vocal_pitch.json"
@@ -271,6 +348,24 @@ def _persist_pitch(
         _rezip_sloppak(source_dir, dlc_path)
 
 
+# ── LRC formatter (export only) ───────────────────────────────────────────────
+
+def _format_lrc(segments: list[dict]) -> str:
+    """Convert alignment segments to the standard LRC line format."""
+    lines = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            t = float(seg["start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        minutes = int(t // 60)
+        seconds = t % 60
+        lines.append(f"[{minutes:02d}:{seconds:05.2f}]{seg.get('text', '')}")
+    return "\n".join(lines) + "\n"
+
+
 # ── HTTP routes ───────────────────────────────────────────────────────────────
 
 def setup(app: FastAPI, context: dict):
@@ -278,19 +373,21 @@ def setup(app: FastAPI, context: dict):
 
     _config_dir = context["config_dir"]
     _get_dlc_dir = context["get_dlc_dir"]
-    SLOPPAK_CACHE_DIR = context.get("get_sloppak_cache_dir", lambda: None)()
+    get_cache = context.get("get_sloppak_cache_dir", lambda: None)
+    SLOPPAK_CACHE_DIR = get_cache()
     if SLOPPAK_CACHE_DIR is None:
         static_dir = Path(os.environ.get("STATIC_DIR", "/app/static"))
         SLOPPAK_CACHE_DIR = static_dir / "sloppak_cache"
+
+    # ── Per-song readiness ────────────────────────────────────────────────
 
     @app.get("/api/plugins/lyrics_karaoke/status")
     def lk_status(filename: str = ""):
         """Per-song readiness check.
 
-        Returns a small flag set the frontend uses to decide between
-        "Generate karaoke pitch" and "Karaoke" toggle states. PSARC songs
-        and sloppaks without a vocals stem are explicitly disabled —
-        karaoke depends on isolated vocal pitch.
+        Returns the flag set the setup screen and the in-player toggle
+        both consume. PSARC songs have ``is_sloppak=False`` and the rest
+        of the flags are meaningless.
         """
         result = {
             "filename": filename,
@@ -316,21 +413,35 @@ def setup(app: FastAPI, context: dict):
             result["pitch_count"] = len(pitch["notes"])
         return result
 
+    @app.get("/api/plugins/lyrics_karaoke/server-status")
+    def lk_server_status():
+        """Health-check the configured alignment / demucs server.
+
+        The setup screen polls this once per visit so the user gets a
+        clear "alignment server unavailable" banner if their config is
+        stale, instead of a cryptic timeout when they hit Build.
+        """
+        url = _get_demucs_server_url()
+        if not url:
+            return {"available": False, "reason": "No demucs server configured"}
+        try:
+            import requests
+            resp = requests.get(f"{url}/health", timeout=5)
+            if resp.status_code == 200:
+                return {"available": True, "server_url": url}
+            return {"available": False, "reason": f"Server returned {resp.status_code}"}
+        except Exception as e:  # noqa: BLE001 — surface to UI
+            return {"available": False, "reason": str(e)}
+
+    # ── Player overlay data ──────────────────────────────────────────────
+
     @app.get("/api/plugins/lyrics_karaoke/data")
     def lk_data(filename: str = ""):
         """Bundle lyrics + pitch into a single per-syllable list.
 
-        The frontend caches this per song and only re-fetches on song
-        change. PSARCs and sloppaks without pitch data return 404 so the
-        frontend never speculatively turns on karaoke for an ineligible
-        song.
-
-        Each entry in ``tokens`` is ``{t, d, w, midi?}`` — the ``midi``
-        field is present only for syllables where pitch extraction
-        produced a confidently-voiced result. Pre-merging on the server
-        avoids a brittle floating-point key match in the renderer (Python
-        and JS round half-cases differently, so a separate ``notes`` list
-        plus a ``t``-keyed lookup loses occasional bars).
+        Pre-merged so the renderer doesn't need to match floats across
+        a Python/JS rounding boundary. ``midi`` is present only on
+        syllables that produced a confidently-voiced pitch.
         """
         resolved = _resolve_sloppak(filename)
         if resolved is None:
@@ -343,11 +454,6 @@ def setup(app: FastAPI, context: dict):
         if not isinstance(notes, list):
             return JSONResponse({"error": "Malformed vocal_pitch.json"}, 500)
 
-        # Index pitch notes by exact serialized `t` so we don't depend on
-        # cross-language rounding semantics. The pitch writer keeps the
-        # lyric's `t` value verbatim (see _extract_pitch_per_syllable),
-        # so the source of truth is "the byte-identical float that came
-        # out of the lyrics list".
         pitch_by_t: dict[str, int] = {}
         for n in notes:
             if isinstance(n, dict) and "t" in n and "midi" in n:
@@ -360,17 +466,112 @@ def setup(app: FastAPI, context: dict):
             if mid is not None:
                 entry["midi"] = mid
             merged.append(entry)
-        return {
-            "filename": filename,
-            "tokens": merged,
-        }
+        return {"filename": filename, "tokens": merged}
 
-    @app.post("/api/plugins/lyrics_karaoke/generate")
-    async def lk_generate(data: dict):
-        """Run pitch extraction on a sloppak's vocals stem and persist
-        ``vocal_pitch.json``. Heavy work runs in a thread; the request
-        is serialized per-filename so a double-click doesn't fork two
-        librosa runs against the same file."""
+    # ── Stage 1: align lyrics text with Whisper ───────────────────────────
+
+    @app.post("/api/plugins/lyrics_karaoke/align")
+    def lk_align(data: dict):
+        """Send vocals + plain lyric text to the alignment server.
+
+        Returns ``{segments: [{start, end, text, ...}]}`` on success.
+        The caller previews this and then POSTs to ``/save-lyrics`` to
+        commit the result to the sloppak.
+        """
+        filename = (data or {}).get("filename", "")
+        lyrics_text = ((data or {}).get("lyrics_text") or "").strip()
+        language = (data or {}).get("language", "")
+        granularity = (data or {}).get("granularity", "syllable")
+
+        if not filename:
+            return JSONResponse({"error": "filename required"}, 400)
+        if not lyrics_text:
+            return JSONResponse({"error": "lyrics_text required"}, 400)
+
+        resolved = _resolve_sloppak(filename)
+        if resolved is None:
+            return JSONResponse({"error": "Not a sloppak"}, 400)
+        source_dir, manifest, _dlc_path, _is_zip = resolved
+
+        vocals_rel = _vocals_rel_path(manifest)
+        if not vocals_rel:
+            return JSONResponse(
+                {"error": "No vocals stem — split stems with Demucs first."},
+                400,
+            )
+        vocals_path = source_dir / vocals_rel
+        if not vocals_path.exists():
+            return JSONResponse(
+                {"error": f"Vocals stem missing on disk: {vocals_rel}"},
+                400,
+            )
+
+        server_url = _get_demucs_server_url()
+        if not server_url:
+            return JSONResponse({"error": "No demucs server configured"}, 400)
+
+        import requests
+        try:
+            with open(vocals_path, "rb") as f:
+                resp = requests.post(
+                    f"{server_url}/align",
+                    files={"file": (vocals_path.name, f, "audio/ogg")},
+                    data={
+                        "text": lyrics_text,
+                        "language": language,
+                        "granularity": granularity,
+                    },
+                    timeout=300,
+                )
+        except requests.Timeout:
+            return JSONResponse({"error": "Alignment request timed out"}, 504)
+        except requests.ConnectionError:
+            return JSONResponse({"error": "Cannot connect to alignment server"}, 502)
+
+        if resp.status_code != 200:
+            return JSONResponse(
+                {"error": f"Alignment server error: {resp.text[:500]}"},
+                502,
+            )
+
+        result = resp.json()
+        if isinstance(result, dict) and "error" in result:
+            return JSONResponse(
+                {"error": f"Alignment failed: {result['error']}"},
+                502,
+            )
+        return result
+
+    @app.post("/api/plugins/lyrics_karaoke/save-lyrics")
+    def lk_save_lyrics(data: dict):
+        """Persist alignment segments as the sloppak's ``lyrics.json``."""
+        filename = (data or {}).get("filename", "")
+        segments = (data or {}).get("segments", []) or []
+        if not filename:
+            return JSONResponse({"error": "filename required"}, 400)
+        if not isinstance(segments, list) or not segments:
+            return JSONResponse({"error": "segments required"}, 400)
+
+        resolved = _resolve_sloppak(filename)
+        if resolved is None:
+            return JSONResponse({"error": "Not a sloppak"}, 400)
+        source_dir, manifest, dlc_path, is_zip = resolved
+
+        try:
+            count = _persist_lyrics(source_dir, manifest, segments, dlc_path, is_zip)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": f"Persist failed: {exc}"}, 500)
+        return {"ok": True, "lyrics_count": count}
+
+    # ── Stage 2: extract per-syllable pitch ───────────────────────────────
+
+    @app.post("/api/plugins/lyrics_karaoke/generate-pitch")
+    async def lk_generate_pitch(data: dict):
+        """Run pYIN on the vocals stem and persist ``vocal_pitch.json``.
+
+        Heavy work runs in the default executor; per-filename locking
+        serializes accidental double-clicks.
+        """
         filename = (data or {}).get("filename", "")
         resolved = _resolve_sloppak(filename)
         if resolved is None:
@@ -383,7 +584,7 @@ def setup(app: FastAPI, context: dict):
         vocals_rel = _vocals_rel_path(manifest)
         if not vocals_rel:
             return JSONResponse(
-                {"error": "No vocals stem in this sloppak — split stems with Demucs first."},
+                {"error": "No vocals stem — split stems with Demucs first."},
                 400,
             )
         vocals_path = source_dir / vocals_rel
@@ -396,15 +597,12 @@ def setup(app: FastAPI, context: dict):
         lyrics = _lyrics_tokens(source_dir, manifest)
         if not lyrics:
             return JSONResponse(
-                {"error": "This sloppak has no synced lyrics — run Lyrics Sync first."},
+                {"error": "No synced lyrics — align lyrics first."},
                 400,
             )
 
-        # Copy the vocals stem to a temp file before handing off to the
-        # worker thread. The unpack cache dir is shared with other readers
-        # (the highway WS, stems plugin, etc.) and re-zip writes a few
-        # hundred MB through it; reading the stem from a temp copy keeps
-        # those concerns separated and dodges any short-window churn.
+        # Read the vocals stem from a temp copy so concurrent writes to
+        # the unpack cache (re-zip etc.) don't churn the working file.
         tmp_dir = Path(tempfile.mkdtemp(prefix="lk-pitch-"))
         try:
             tmp_vocals = tmp_dir / vocals_path.name
@@ -413,12 +611,10 @@ def setup(app: FastAPI, context: dict):
             lock = _job_lock_for(filename)
 
             def _worker() -> tuple[bool, dict]:
-                # Per-filename lock kept inside the worker thread so the
-                # request thread itself never blocks on a slow extract.
                 with lock:
                     try:
                         notes = _extract_pitch_per_syllable(tmp_vocals, lyrics)
-                    except Exception as exc:  # noqa: BLE001 — surface to UI
+                    except Exception as exc:  # noqa: BLE001
                         return False, {"error": f"Pitch extraction failed: {exc}"}
                     if not notes:
                         return False, {
@@ -443,3 +639,40 @@ def setup(app: FastAPI, context: dict):
             return payload
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # ── Optional export ───────────────────────────────────────────────────
+
+    @app.post("/api/plugins/lyrics_karaoke/export")
+    def lk_export(data: dict):
+        """Produce a downloadable ``.lrc`` file from alignment segments.
+
+        Independent of save-to-song — useful for sharing the synced
+        lyrics outside the sloppak (e.g. submitting to lyric DBs).
+        """
+        segments = (data or {}).get("segments", []) or []
+        if not isinstance(segments, list) or not segments:
+            return JSONResponse({"error": "No segments provided"}, 400)
+
+        title = str((data or {}).get("title", "") or "")
+        artist = str((data or {}).get("artist", "") or "")
+
+        header_lines = []
+        if title:
+            header_lines.append(f"[ti:{title}]")
+        if artist:
+            header_lines.append(f"[ar:{artist}]")
+        header_lines.append("[by:Slopsmith Lyrics Karaoke]")
+        header = "\n".join(header_lines) + "\n"
+
+        lrc = header + _format_lrc(segments)
+
+        safe_name = f"{artist} - {title}".strip(" -") or "lyrics"
+        safe_name = safe_name.replace("/", "_").replace("\\", "_")
+
+        return Response(
+            content=lrc,
+            media_type="text/plain",
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}.lrc"',
+            },
+        )
