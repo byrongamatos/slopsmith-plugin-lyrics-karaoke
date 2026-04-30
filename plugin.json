@@ -1,7 +1,7 @@
 {
   "id": "lyrics_karaoke",
   "name": "Lyrics Karaoke",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "private": false,
   "nav": { "label": "Lyrics Karaoke", "screen": "plugin-lyrics_karaoke" },
   "screen": "screen.html",

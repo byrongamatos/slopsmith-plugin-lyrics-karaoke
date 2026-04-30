@@ -29,6 +29,7 @@
     let currentSong = null;          // {filename, format, ...} from window.slopsmith
     let status = null;               // last /status payload
     let pitchData = null;            // {tokens: [{t, d, w, midi?}, ...]}
+    let songPitchRange = null;       // {lo, hi} fixed across the song so bars don't shift vertically as the window scrolls
     let karaokeMode = false;         // user toggle
     let savedShowLyrics = true;      // restore on toggle off
     let generating = false;          // suppress double-clicks during /generate
@@ -118,7 +119,35 @@
         if (token !== inflightFetch) return null;
         if (!res.ok) return null;
         pitchData = res.body;
+        songPitchRange = computeSongPitchRange(pitchData);
         return pitchData;
+    }
+
+    // Compute a fixed pitch range for the whole song so a syllable's
+    // vertical position stays put as the playhead scrolls. The previous
+    // code recomputed lo/hi from the visible window every frame, which
+    // made stable bars appear to jump (a bar at the centre of the strip
+    // would suddenly snap to the top when a lower-pitched syllable
+    // entered the window). We trim 5%/95% percentiles so a single
+    // octave-error outlier doesn't squash the rest of the song flat.
+    function computeSongPitchRange(data) {
+        const tokens = (data && Array.isArray(data.tokens)) ? data.tokens : [];
+        const midis = [];
+        for (const t of tokens) {
+            if (t && typeof t.midi === 'number') midis.push(t.midi);
+        }
+        if (!midis.length) return { lo: 60, hi: 60 + MIN_PITCH_SPAN_SEMITONES };
+        midis.sort((a, b) => a - b);
+        const pct = (p) => midis[Math.min(midis.length - 1, Math.max(0, Math.floor(p * (midis.length - 1))))];
+        let lo = pct(0.05);
+        let hi = pct(0.95);
+        if (hi - lo < MIN_PITCH_SPAN_SEMITONES) {
+            const center = (hi + lo) / 2;
+            const half = MIN_PITCH_SPAN_SEMITONES / 2;
+            lo = center - half;
+            hi = center + half;
+        }
+        return { lo, hi };
     }
 
     // ── Button wiring ──────────────────────────────────────────────────
@@ -391,14 +420,13 @@
         const out = [];
         for (const tok of pitchData.tokens) {
             if (!tok || typeof tok.t !== 'number') continue;
-            // Skip syllables that lacked confident voicing — the backend
-            // omits `midi` for those. The text strip below the bars also
-            // omits them so the visual stays a clean ribbon rather than
-            // gappy blocks of orphan text.
-            if (typeof tok.midi !== 'number') continue;
             const t1 = tok.t + (tok.d || 0);
             if (t1 < winLeft || tok.t > winRight) continue;
-            out.push({ tok, midi: tok.midi });
+            // Tokens without midi still get rendered as text-only so a
+            // whole phrase that pYIN couldn't voice (e.g. quiet/whispered
+            // sections) doesn't vanish from the chart.
+            const hasMidi = typeof tok.midi === 'number';
+            out.push({ tok, midi: hasMidi ? tok.midi : null });
         }
         return out;
     }
@@ -442,7 +470,11 @@
         const xFor = (t) => playheadX + (t - now) * pxPerSec;
 
         const visible = visibleBars(now);
-        const { lo, hi } = pitchRange(visible);
+        // Use the song-wide pitch range so a bar's vertical position
+        // doesn't shift as new syllables enter/leave the visible window.
+        // Fall back to a per-frame range only when the song-wide range
+        // hasn't been computed yet (data still loading).
+        const { lo, hi } = songPitchRange || pitchRange(visible);
 
         // Reserve the bottom ~36px for syllable text; the bars live above.
         const dpr = window.devicePixelRatio || 1;
@@ -467,24 +499,29 @@
             const x1 = xFor(tok.t + (tok.d || 0));
             const w = Math.max(2 * dpr, x1 - x0 - 2 * BAR_PAD_PX * dpr);
             const x = x0 + BAR_PAD_PX * dpr;
-            const y = yFor(midi);
 
             const isPast = (tok.t + (tok.d || 0)) <= now;
             const isActive = tok.t <= now && now < tok.t + (tok.d || 0);
 
-            // Draw the dim "future" / "past unreached" bar in full.
-            ctx.fillStyle = BAR_COLOR_DIM;
-            roundFillRect(ctx, x, y, w, barHeight, BAR_RADIUS * dpr);
+            if (midi !== null) {
+                const y = yFor(midi);
 
-            // Fill the portion to the left of the playhead in bright color.
-            const fillRight = Math.max(x, Math.min(x + w, playheadX));
-            const fillW = fillRight - x;
-            if (fillW > 0 && (isPast || isActive)) {
-                ctx.fillStyle = isActive ? BAR_COLOR_ACTIVE : BAR_COLOR_FILL;
-                roundFillRect(ctx, x, y, fillW, barHeight, BAR_RADIUS * dpr);
+                // Draw the dim "future" / "past unreached" bar in full.
+                ctx.fillStyle = BAR_COLOR_DIM;
+                roundFillRect(ctx, x, y, w, barHeight, BAR_RADIUS * dpr);
+
+                // Fill the portion to the left of the playhead in bright color.
+                const fillRight = Math.max(x, Math.min(x + w, playheadX));
+                const fillW = fillRight - x;
+                if (fillW > 0 && (isPast || isActive)) {
+                    ctx.fillStyle = isActive ? BAR_COLOR_ACTIVE : BAR_COLOR_FILL;
+                    roundFillRect(ctx, x, y, fillW, barHeight, BAR_RADIUS * dpr);
+                }
             }
 
             // Syllable text below the bar, centered on its midpoint.
+            // Render even when midi is missing so phrases pYIN couldn't
+            // voice still appear in the lyric stream.
             const text = syllableText(tok);
             if (text) {
                 ctx.fillStyle = isPast ? TEXT_COLOR_PAST : TEXT_COLOR;
@@ -538,6 +575,7 @@
         currentSong = song || null;
         status = null;
         pitchData = null;
+        songPitchRange = null;
         // Tear the overlay all the way down so a previous song's bars
         // don't briefly flash for the new song before its data arrives.
         teardownOverlay();

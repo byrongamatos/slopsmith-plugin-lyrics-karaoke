@@ -227,37 +227,49 @@ def _extract_pitch_per_syllable(vocals_path: Path, lyrics: list[dict]) -> list[d
     f0 = np.asarray(f0)
     voiced_flag = np.asarray(voiced_flag, dtype=bool)
 
-    out: list[dict] = []
+    # Two-pass extraction. First pass: pull a confident median per
+    # syllable where pYIN voiced enough frames. Second pass: for tokens
+    # that didn't get a confident pitch (short syllables, whispered/quiet
+    # phrases, frames where pYIN failed to lock), borrow the nearest
+    # neighbour's midi so the frontend still emits a bar — otherwise
+    # whole phrases disappear from the chart. Token order is preserved.
     n_frames = len(times)
+    raw: list[dict] = []
     for tok in lyrics:
         t0 = tok["t"]
         t1 = t0 + tok["d"]
         # np.searchsorted is O(log N) — cheap even for thousands of tokens.
         i0 = int(np.searchsorted(times, t0, side="left"))
         i1 = int(np.searchsorted(times, t1, side="right"))
-        if i0 >= n_frames or i1 <= i0:
-            continue
-        seg = f0[i0:i1]
-        seg_voiced = voiced_flag[i0:i1]
-        seg = seg[seg_voiced]
-        # Drop NaNs that may sneak past voiced_flag on edge frames.
-        seg = seg[~np.isnan(seg)]
-        # Need a minimum of voiced frames to be confident — short hits or
-        # purely consonantal syllables shouldn't produce a bar.
-        if seg.size < 3:
-            continue
-        median_hz = float(np.median(seg))
-        if median_hz <= 0:
-            continue
-        midi = int(round(69 + 12 * np.log2(median_hz / 440.0)))
-        # Keep `t` and `d` byte-identical to the lyric token so the
-        # frontend can match by exact value without a rounding dance.
-        out.append({
-            "t": t0,
-            "d": tok["d"],
-            "midi": midi,
-        })
-    return out
+        midi: int | None = None
+        if i1 > i0 and i0 < n_frames:
+            seg = f0[i0:i1]
+            seg_voiced = voiced_flag[i0:i1]
+            seg = seg[seg_voiced]
+            seg = seg[~np.isnan(seg)]
+            # One voiced frame is enough to place a bar — the median of
+            # a single sample is just that sample, which is still a
+            # better estimate than dropping the syllable entirely.
+            if seg.size >= 1:
+                median_hz = float(np.median(seg))
+                if median_hz > 0:
+                    midi = int(round(69 + 12 * np.log2(median_hz / 440.0)))
+        raw.append({"t": t0, "d": tok["d"], "midi": midi})
+
+    # Borrow midi from the nearest neighbour (by time index) for any
+    # token that came back as None. Skip the borrow if the entire song
+    # has no confident pitch — there's nothing to borrow from.
+    confident = [(i, r["midi"]) for i, r in enumerate(raw) if r["midi"] is not None]
+    if confident:
+        for i, r in enumerate(raw):
+            if r["midi"] is not None:
+                continue
+            # Find nearest confident token by absolute index distance —
+            # raw is in time order so this is also nearest-in-time.
+            nearest = min(confident, key=lambda c: abs(c[0] - i))
+            r["midi"] = nearest[1]
+
+    return [r for r in raw if r["midi"] is not None]
 
 
 # ── Persistence: write JSON + patch manifest + re-zip ─────────────────────────
