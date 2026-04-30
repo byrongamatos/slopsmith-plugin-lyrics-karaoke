@@ -329,6 +329,51 @@ def _extract_pitch_per_syllable(vocals_path: Path, lyrics: list[dict]) -> list[d
     return [r for r in raw if r["midi"] is not None]
 
 
+def _extract_pitch_via_server(server_url: str, vocals_path: Path, lyrics: list[dict]) -> list[dict]:
+    """Ask the demucs server's CREPE-backed /pitch endpoint for per-syllable
+    midis. Raises on transport failure / non-2xx so the caller can fall
+    back to the local extractor. Returns the same shape as
+    ``_extract_pitch_per_syllable`` so callers are interchangeable.
+    """
+    import requests  # noqa: WPS433 — matches /align's local import style
+
+    payload_lyrics = json.dumps(
+        [{"t": float(t["t"]), "d": float(t["d"])} for t in lyrics]
+    )
+    with open(vocals_path, "rb") as f:
+        resp = requests.post(
+            f"{server_url}/pitch",
+            files={"file": (vocals_path.name, f, "audio/ogg")},
+            data={"lyrics": payload_lyrics},
+            timeout=600,  # CREPE on CPU on a long song can take a few minutes
+        )
+    if resp.status_code == 404 or resp.status_code == 501:
+        # /pitch isn't available on this server (older build or torchcrepe
+        # not installed). Signal the caller to fall back.
+        raise NotImplementedError(f"server has no /pitch endpoint (HTTP {resp.status_code})")
+    resp.raise_for_status()
+    body = resp.json()
+    if isinstance(body, dict) and "error" in body:
+        raise RuntimeError(f"server /pitch error: {body['error']}")
+    notes = body.get("notes") if isinstance(body, dict) else None
+    if not isinstance(notes, list):
+        raise RuntimeError("server /pitch response missing 'notes' list")
+    # Coerce to the local shape: int midi, float t/d.
+    out: list[dict] = []
+    for n in notes:
+        if not isinstance(n, dict):
+            continue
+        try:
+            out.append({
+                "t": float(n["t"]),
+                "d": float(n["d"]),
+                "midi": int(n["midi"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
 # ── Persistence: write JSON + patch manifest + re-zip ─────────────────────────
 
 def _rezip_sloppak(source_dir: Path, output_path: Path) -> None:
@@ -679,12 +724,31 @@ def setup(app: FastAPI, context: dict):
 
             lock = _job_lock_for(filename)
 
+            server_url = _get_demucs_server_url()
+
             def _worker() -> tuple[bool, dict]:
                 with lock:
-                    try:
-                        notes = _extract_pitch_per_syllable(tmp_vocals, lyrics)
-                    except Exception as exc:  # noqa: BLE001
-                        return False, {"error": f"Pitch extraction failed: {exc}"}
+                    notes: list[dict] | None = None
+                    used_server = False
+                    # Try the demucs server's /pitch endpoint first when
+                    # configured — CREPE on the GPU is dramatically more
+                    # accurate than pYIN here. Fall through to the local
+                    # extractor on any transport / availability failure
+                    # so users without the server (or on an older build
+                    # without /pitch) keep working.
+                    if server_url:
+                        try:
+                            notes = _extract_pitch_via_server(server_url, tmp_vocals, lyrics)
+                            used_server = True
+                        except NotImplementedError:
+                            print("[lyrics_karaoke] /pitch not available on demucs server, using local pYIN")
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"[lyrics_karaoke] demucs /pitch failed ({exc}); falling back to local pYIN")
+                    if notes is None:
+                        try:
+                            notes = _extract_pitch_per_syllable(tmp_vocals, lyrics)
+                        except Exception as exc:  # noqa: BLE001
+                            return False, {"error": f"Pitch extraction failed: {exc}"}
                     if not notes:
                         return False, {
                             "error": (
@@ -700,6 +764,7 @@ def setup(app: FastAPI, context: dict):
                         "ok": True,
                         "notes_count": len(notes),
                         "syllables_total": len(lyrics),
+                        "extractor": "server-crepe" if used_server else "local-pyin",
                     }
 
             ok, payload = await asyncio.get_event_loop().run_in_executor(None, _worker)
