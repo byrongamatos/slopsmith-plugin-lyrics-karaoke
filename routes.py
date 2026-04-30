@@ -196,7 +196,25 @@ def _read_pitch_file(source_dir: Path, manifest: dict) -> dict | None:
 
 def _extract_pitch_per_syllable(vocals_path: Path, lyrics: list[dict]) -> list[dict]:
     """Run pYIN on the vocals stem and return one ``{t, d, midi}`` per
-    confidently-voiced syllable. Unvoiced / too-short tokens are dropped."""
+    syllable. The pipeline:
+
+    1. Scan once with a wide fmin/fmax (C2-C6) to discover the singer's
+       actual pitch centre — pYIN's octave error rate goes down a lot
+       when the search range is narrowed to ~one octave around the
+       singer's median.
+    2. Re-scan with the narrowed range and use voiced_prob to weight
+       per-frame pitches rather than treating voiced_flag as a binary
+       gate (recovers pitched-but-quiet tails of held notes).
+    3. Per syllable, take the **mode of semitone-rounded f0** instead of
+       the median Hz — robust to a few wrong frames mid-syllable that
+       would otherwise pull a Hz median off by a semitone.
+    4. Apply per-token octave-error correction against the song-wide
+       median midi. pYIN frequently misplaces a syllable an octave up
+       or down on quiet/breathy notes; if shifting by ±12 brings the
+       token closer to the median, do it.
+    5. Neighbour-borrow midi for any token that still has none so whole
+       phrases don't vanish from the chart.
+    """
     import numpy as np  # noqa: WPS433 — local import keeps cold start cheap
     import librosa
 
@@ -205,68 +223,107 @@ def _extract_pitch_per_syllable(vocals_path: Path, lyrics: list[dict]) -> list[d
     if y.size == 0:
         return []
 
-    fmin = librosa.note_to_hz("C2")  # ~65.4 Hz — covers low male vocals
-    fmax = librosa.note_to_hz("C6")  # ~1046 Hz — covers high female / falsetto
     hop_length = 256
     frame_length = 2048
+    wide_fmin = librosa.note_to_hz("C2")  # ~65.4 Hz — low male
+    wide_fmax = librosa.note_to_hz("C6")  # ~1046 Hz — high female / falsetto
 
-    # pyin returns (f0, voiced_flag, voiced_prob). f0 is NaN where unvoiced.
-    f0, voiced_flag, _voiced_prob = librosa.pyin(
-        y,
-        fmin=fmin,
-        fmax=fmax,
-        sr=sr,
-        frame_length=frame_length,
-        hop_length=hop_length,
-    )
+    def _run_pyin(fmin, fmax):
+        return librosa.pyin(
+            y,
+            fmin=fmin,
+            fmax=fmax,
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length,
+        )
 
-    if f0 is None or len(f0) == 0:
+    # Pass 1: wide search to find the singer's actual range centre.
+    f0_wide, _voiced_wide, prob_wide = _run_pyin(wide_fmin, wide_fmax)
+    if f0_wide is None or len(f0_wide) == 0:
         return []
+
+    f0_wide = np.asarray(f0_wide)
+    prob_wide = np.asarray(prob_wide)
+    confident_mask = (prob_wide > 0.5) & ~np.isnan(f0_wide) & (f0_wide > 0)
+    if int(confident_mask.sum()) >= 32:
+        midis_wide = 69 + 12 * np.log2(f0_wide[confident_mask] / 440.0)
+        median_midi = float(np.median(midis_wide))
+        # Narrow ±12 semitones around the median, clamped to the wide
+        # range so an outlier-skewed median can't push us out of bounds.
+        narrow_fmin = max(wide_fmin, 440.0 * (2 ** ((median_midi - 12 - 69) / 12)))
+        narrow_fmax = min(wide_fmax, 440.0 * (2 ** ((median_midi + 12 - 69) / 12)))
+        f0, _voiced, voiced_prob = _run_pyin(narrow_fmin, narrow_fmax)
+        if f0 is None or len(f0) == 0:
+            f0, voiced_prob = f0_wide, prob_wide
+    else:
+        # Not enough voiced material to narrow confidently — keep the
+        # wide-range result rather than risk centering on noise.
+        f0, voiced_prob = f0_wide, prob_wide
 
     times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
     f0 = np.asarray(f0)
-    voiced_flag = np.asarray(voiced_flag, dtype=bool)
-
-    # Two-pass extraction. First pass: pull a confident median per
-    # syllable where pYIN voiced enough frames. Second pass: for tokens
-    # that didn't get a confident pitch (short syllables, whispered/quiet
-    # phrases, frames where pYIN failed to lock), borrow the nearest
-    # neighbour's midi so the frontend still emits a bar — otherwise
-    # whole phrases disappear from the chart. Token order is preserved.
+    voiced_prob = np.asarray(voiced_prob)
     n_frames = len(times)
+
+    # Per-syllable: weighted mode of semitone-rounded pitches. Frames
+    # with low voicing probability still contribute (just less), which
+    # rescues quiet held tails the binary voiced_flag would discard.
     raw: list[dict] = []
     for tok in lyrics:
         t0 = tok["t"]
         t1 = t0 + tok["d"]
-        # np.searchsorted is O(log N) — cheap even for thousands of tokens.
         i0 = int(np.searchsorted(times, t0, side="left"))
         i1 = int(np.searchsorted(times, t1, side="right"))
         midi: int | None = None
         if i1 > i0 and i0 < n_frames:
-            seg = f0[i0:i1]
-            seg_voiced = voiced_flag[i0:i1]
-            seg = seg[seg_voiced]
-            seg = seg[~np.isnan(seg)]
-            # One voiced frame is enough to place a bar — the median of
-            # a single sample is just that sample, which is still a
-            # better estimate than dropping the syllable entirely.
-            if seg.size >= 1:
-                median_hz = float(np.median(seg))
-                if median_hz > 0:
-                    midi = int(round(69 + 12 * np.log2(median_hz / 440.0)))
+            seg_hz = f0[i0:i1]
+            seg_w = voiced_prob[i0:i1]
+            mask = (~np.isnan(seg_hz)) & (seg_hz > 0) & (seg_w > 0.2)
+            if mask.any():
+                hz = seg_hz[mask]
+                w = seg_w[mask]
+                semitones = np.rint(69 + 12 * np.log2(hz / 440.0)).astype(int)
+                # Weighted histogram across unique semitones — pick the
+                # one with the highest summed voicing probability.
+                unique = np.unique(semitones)
+                weights = np.array(
+                    [float(w[semitones == u].sum()) for u in unique],
+                    dtype=float,
+                )
+                midi = int(unique[int(np.argmax(weights))])
         raw.append({"t": t0, "d": tok["d"], "midi": midi})
 
-    # Borrow midi from the nearest neighbour (by time index) for any
-    # token that came back as None. Skip the borrow if the entire song
-    # has no confident pitch — there's nothing to borrow from.
-    confident = [(i, r["midi"]) for i, r in enumerate(raw) if r["midi"] is not None]
-    if confident:
+    # Octave-error correction. Build the song-wide median midi from
+    # tokens that did get a confident estimate, then for each token
+    # check whether shifting by ±12 brings it closer to that median.
+    # This catches pYIN's classic failure mode where a single quiet
+    # note jumps an octave up/down from the surrounding melody.
+    confident_midis = [r["midi"] for r in raw if r["midi"] is not None]
+    if len(confident_midis) >= 8:
+        song_median = float(np.median(confident_midis))
+        for r in raw:
+            if r["midi"] is None:
+                continue
+            base = int(r["midi"])
+            best = base
+            best_dist = abs(base - song_median)
+            for shift in (-12, 12):
+                cand = base + shift
+                d = abs(cand - song_median)
+                if d < best_dist:
+                    best, best_dist = cand, d
+            r["midi"] = best
+
+    # Neighbour-borrow for tokens that still have no midi (short
+    # consonant-only syllables, fully unvoiced phrases). Skip if the
+    # whole song has no confident pitch — nothing to borrow from.
+    indexed_confident = [(i, r["midi"]) for i, r in enumerate(raw) if r["midi"] is not None]
+    if indexed_confident:
         for i, r in enumerate(raw):
             if r["midi"] is not None:
                 continue
-            # Find nearest confident token by absolute index distance —
-            # raw is in time order so this is also nearest-in-time.
-            nearest = min(confident, key=lambda c: abs(c[0] - i))
+            nearest = min(indexed_confident, key=lambda c: abs(c[0] - i))
             r["midi"] = nearest[1]
 
     return [r for r in raw if r["midi"] is not None]
