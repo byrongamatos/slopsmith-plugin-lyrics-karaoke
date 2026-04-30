@@ -1,0 +1,8 @@
+{
+  "id": "lyrics_karaoke",
+  "name": "Lyrics Karaoke",
+  "version": "1.0.0",
+  "private": false,
+  "script": "screen.js",
+  "routes": "routes.py"
+}
