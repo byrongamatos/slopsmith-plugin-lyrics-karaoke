@@ -213,7 +213,7 @@
             generating = true;
             refreshButtonState();
             try {
-                const res = await safeFetch('/api/plugins/lyrics_karaoke/generate', {
+                const res = await safeFetch('/api/plugins/lyrics_karaoke/generate-pitch', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ filename: clickFilename }),
