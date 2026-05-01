@@ -170,9 +170,20 @@
         lyricsBtn.parentNode.insertBefore(toggleBtn, lyricsBtn.nextSibling);
         // Hidden until song:loaded tells us whether to show it.
         toggleBtn.style.display = 'none';
+        // The mic-feedback button rides next to the karaoke toggle and
+        // only surfaces while karaoke mode is active. Inject it now so
+        // the button order is stable; refreshMicUi() handles visibility.
+        ensureMicButton();
     }
 
     function refreshButtonState() {
+        refreshKaraokeToggle();
+        // Mic UI tracks the karaoke toggle's eligibility — keep them
+        // updated together so toggling/hiding can't desync.
+        refreshMicUi();
+    }
+
+    function refreshKaraokeToggle() {
         if (!toggleBtn) return;
         const sloppak = isSloppakSong(currentSong);
         if (!sloppak) {
@@ -306,6 +317,11 @@
             showOverlay();
         } else {
             hideOverlay();
+            // Tear the mic stream down with the overlay — there's nothing
+            // to render to. keepFlag preserves the on/off intent so the
+            // next karaoke toggle on the same song respects the choice.
+            if (micState !== 'off') stopMic({ keepFlag: true });
+            resetUserResults();
             if (window.highway && typeof window.highway.setLyricsVisible === 'function') {
                 window.highway.setLyricsVisible(savedShowLyrics);
             }
@@ -531,6 +547,52 @@
             }
         }
 
+        // Mic-feedback overlays — only when the user has been singing.
+        if (userResults.size > 0 || micState === 'listening') {
+            for (const { tok, midi } of visible) {
+                if (midi == null) continue;
+                const idx = pitchData.tokens.indexOf(tok);
+                const entry = userResults.get(idx);
+                if (!entry || entry.samplesIn === 0) continue;
+                const acc = entry.accuracy;
+                const x0 = xFor(tok.t);
+                const x1 = xFor(tok.t + (tok.d || 0));
+                const w = Math.max(2 * dpr, x1 - x0 - 2 * BAR_PAD_PX * dpr);
+                const x = x0 + BAR_PAD_PX * dpr;
+                const y = yFor(midi);
+                ctx.fillStyle = `rgba(${Math.round(255 * (1 - acc))}, ${Math.round(255 * acc)}, 64, 0.55)`;
+                roundFillRect(ctx, x, y, w, barHeight, BAR_RADIUS * dpr);
+            }
+
+            const SAMPLE_FRESH_S = _LK_SAMPLE_FRESH_MS / 1000;
+            const fresh = (now - userLastSampleAt) <= SAMPLE_FRESH_S;
+            if (fresh && userPitchSamples.length) {
+                const last = userPitchSamples[userPitchSamples.length - 1];
+                if (userDisplayMidi == null) {
+                    userDisplayMidi = last.midi;
+                } else {
+                    // Simple low-pass (α=0.4) keeps the line from snapping
+                    // jaggedly between adjacent semitones without lagging.
+                    userDisplayMidi += 0.4 * (last.midi - userDisplayMidi);
+                }
+                const drawMidi = Math.round(userDisplayMidi);
+                const yLine = yFor(drawMidi);
+                const yMin = barTop;
+                const yMax = barTop + Math.max(0, barBand - barHeight);
+                const yClipped = Math.max(yMin, Math.min(yMax, yLine));
+                ctx.fillStyle = _LK_PITCH_LINE_COLOR;
+                const lineX = playheadX - 30 * dpr;
+                const lineW = 34 * dpr;
+                const lineY = yClipped + barHeight / 2 - 1.5 * dpr;
+                ctx.fillRect(lineX, lineY, lineW, 3 * dpr);
+            } else {
+                // Discard the smoothed value so re-acquire snaps cleanly
+                // rather than drifting from the last fresh pitch.
+                userDisplayMidi = null;
+            }
+            updateMicPill();
+        }
+
         // Playhead.
         ctx.strokeStyle = PLAYHEAD_COLOR;
         ctx.lineWidth = Math.max(1, 1.5 * dpr);
@@ -556,6 +618,351 @@
         c.fill();
     }
 
+    // ── Mic pitch feedback (live) ──────────────────────────────────────
+    //
+    // YIN + getUserMedia + ScriptProcessor accumulator are copied from
+    // plugins/note_detect/screen.js. Vocals are monophonic so YIN alone
+    // is sufficient — no CREPE/HPS/WASM. Keep this in sync with
+    // note_detect when its YIN implementation changes; once a third
+    // consumer arrives, factor into a shared module.
+    const _LK_YIN_FRAME_SIZE = 2048;
+    const _LK_YIN_MIN_SAMPLES = 4096;
+    const _LK_YIN_MIN_HZ = 50;        // human vocal floor — drops sub-bass artefacts
+    const _LK_YIN_MAX_HZ = 1100;      // upper end of soprano range
+    const _LK_YIN_CONFIDENCE = 0.5;   // YIN clarity score; below = unvoiced
+    const _LK_MATCH_TOLERANCE = 1.0;  // semitones; locked for v1
+    const _LK_SAMPLE_FRESH_MS = 200;  // stale samples don't draw the user line
+    const _LK_SAMPLE_RING_CAP = 256;  // ~12 s at 50 ms cadence
+    const _LK_STORAGE_KEY = 'lyrics_karaoke.micFeedback';
+    const _LK_PITCH_LINE_COLOR = '#22d3ee';
+    const _LK_PITCH_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+    function midiToName(midi) {
+        const r = Math.round(midi);
+        const pc = ((r % 12) + 12) % 12;
+        const oct = Math.floor(r / 12) - 1;
+        return _LK_PITCH_NAMES[pc] + oct;
+    }
+
+    function freqToMidi(freq) {
+        return 12 * Math.log2(freq / 440) + 69;
+    }
+
+    function yinDetect(buffer, sampleRate, minFreqHz) {
+        const threshold = 0.15;
+        const halfLen = Math.floor(buffer.length / 2);
+        const minHalfLenForFreq = Math.ceil(sampleRate / minFreqHz);
+        if (halfLen < minHalfLenForFreq) return { freq: -1, confidence: 0 };
+        const yinBuffer = new Float32Array(halfLen);
+        let runningSum = 0;
+        yinBuffer[0] = 1;
+        for (let tau = 1; tau < halfLen; tau++) {
+            let sum = 0;
+            for (let i = 0; i < halfLen; i++) {
+                const delta = buffer[i] - buffer[i + tau];
+                sum += delta * delta;
+            }
+            yinBuffer[tau] = sum;
+            runningSum += sum;
+            yinBuffer[tau] *= tau / runningSum;
+        }
+        let tau = 2;
+        while (tau < halfLen) {
+            if (yinBuffer[tau] < threshold) {
+                while (tau + 1 < halfLen && yinBuffer[tau + 1] < yinBuffer[tau]) tau++;
+                break;
+            }
+            tau++;
+        }
+        if (tau === halfLen) return { freq: -1, confidence: 0 };
+        const s0 = tau > 0 ? yinBuffer[tau - 1] : yinBuffer[tau];
+        const s1 = yinBuffer[tau];
+        const s2 = tau + 1 < halfLen ? yinBuffer[tau + 1] : yinBuffer[tau];
+        const betterTau = tau + (s0 - s2) / (2 * (s0 - 2 * s1 + s2));
+        return {
+            freq: sampleRate / betterTau,
+            confidence: Math.max(0, 1 - yinBuffer[tau]),
+        };
+    }
+
+    // Mic state — implicit-flag style mirroring note_detect's pattern.
+    let micState = 'off';            // 'off' | 'requesting' | 'listening' | 'error'
+    let micBtn = null;
+    let micPill = null;
+    let micStream = null;
+    let micCtx = null;
+    let micSourceNode = null;
+    let micProcessor = null;
+    let micTimer = null;
+    let micSessionGen = 0;            // bumped on stop to invalidate stale frames
+    let micAccumBuffer = new Float32Array(0);
+    let micPendingBuffer = null;
+    let micErrorMsg = '';
+
+    // Per-song bookkeeping for the live overlay.
+    const userPitchSamples = [];      // ring of {t, midi, confidence}
+    const userResults = new Map();    // tokenIndex → {samplesIn, samplesMatched, accuracy}
+    let userDisplayMidi = null;       // smoothed value used for the pitch line + pill
+    let userLastSampleAt = -Infinity;
+
+    function songHasMidi() {
+        if (!pitchData || !Array.isArray(pitchData.tokens)) return false;
+        for (const t of pitchData.tokens) {
+            if (t && typeof t.midi === 'number') return true;
+        }
+        return false;
+    }
+
+    function resetUserResults() {
+        userPitchSamples.length = 0;
+        userResults.clear();
+        userDisplayMidi = null;
+        userLastSampleAt = -Infinity;
+    }
+
+    function findActiveTokenIndex(time) {
+        // Latest-starting token whose [t, t+d) contains `time` wins, so an
+        // overlapping next-syllable claim takes priority over the trailing
+        // tail of the previous one. Linear scan is fine — token counts
+        // are typically a few hundred per song.
+        if (!pitchData || !Array.isArray(pitchData.tokens)) return -1;
+        let bestIdx = -1;
+        let bestStart = -Infinity;
+        for (let i = 0; i < pitchData.tokens.length; i++) {
+            const tok = pitchData.tokens[i];
+            if (!tok || typeof tok.t !== 'number' || typeof tok.midi !== 'number') continue;
+            const t0 = tok.t;
+            const t1 = t0 + (tok.d || 0);
+            if (time < t0 || time >= t1) continue;
+            if (t0 > bestStart) { bestStart = t0; bestIdx = i; }
+        }
+        return bestIdx;
+    }
+
+    function processYinFrame(buffer, sampleRate, capturedAt, sessionAtCapture) {
+        if (sessionAtCapture !== micSessionGen) return;  // stop happened mid-frame
+        const r = yinDetect(buffer, sampleRate, _LK_YIN_MIN_HZ);
+        if (!r || r.freq <= 0 || r.confidence < _LK_YIN_CONFIDENCE) return;
+        if (r.freq < _LK_YIN_MIN_HZ || r.freq > _LK_YIN_MAX_HZ) return;
+        const midi = freqToMidi(r.freq);
+        if (!isFinite(midi)) return;
+
+        userPitchSamples.push({ t: capturedAt, midi, confidence: r.confidence });
+        if (userPitchSamples.length > _LK_SAMPLE_RING_CAP) userPitchSamples.shift();
+        userLastSampleAt = capturedAt;
+
+        const idx = findActiveTokenIndex(capturedAt);
+        if (idx < 0) return;
+        const tok = pitchData.tokens[idx];
+        let entry = userResults.get(idx);
+        if (!entry) {
+            entry = { samplesIn: 0, samplesMatched: 0, accuracy: 0 };
+            userResults.set(idx, entry);
+        }
+        entry.samplesIn += 1;
+        if (Math.abs(midi - tok.midi) <= _LK_MATCH_TOLERANCE) entry.samplesMatched += 1;
+        entry.accuracy = entry.samplesMatched / entry.samplesIn;
+    }
+
+    async function startMic() {
+        if (micState === 'listening' || micState === 'requesting') return;
+        micState = 'requesting';
+        micErrorMsg = '';
+        refreshMicUi();
+
+        const session = ++micSessionGen;
+        try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                const isHttp = location.protocol === 'http:'
+                    && location.hostname !== 'localhost'
+                    && location.hostname !== '127.0.0.1';
+                throw new Error(isHttp
+                    ? 'Microphone access requires HTTPS (or localhost).'
+                    : 'Microphone access is not available in this browser. Try Chrome or Edge.');
+            }
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    channelCount: 1,
+                },
+            });
+            if (session !== micSessionGen) {
+                // Stop happened while the permission prompt was open.
+                stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) { /* noop */ } });
+                return;
+            }
+            micStream = stream;
+            micCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (micCtx.state === 'suspended') {
+                try { await micCtx.resume(); } catch (_) { /* noop */ }
+            }
+            micSourceNode = micCtx.createMediaStreamSource(micStream);
+            micProcessor = micCtx.createScriptProcessor(_LK_YIN_FRAME_SIZE, 1, 1);
+            micAccumBuffer = new Float32Array(0);
+            micPendingBuffer = null;
+
+            micProcessor.onaudioprocess = (e) => {
+                if (micState !== 'listening') return;
+                const input = e.inputBuffer.getChannelData(0);
+                const prev = micAccumBuffer;
+                const combined = new Float32Array(prev.length + input.length);
+                combined.set(prev);
+                combined.set(input, prev.length);
+                if (combined.length >= _LK_YIN_MIN_SAMPLES) {
+                    const start = combined.length - _LK_YIN_MIN_SAMPLES;
+                    micPendingBuffer = combined.slice(start, start + _LK_YIN_MIN_SAMPLES);
+                    micAccumBuffer = new Float32Array(0);
+                } else {
+                    micAccumBuffer = combined;
+                }
+            };
+
+            micSourceNode.connect(micProcessor);
+            // ScriptProcessor needs a sink to actually pump audio. Routing
+            // to destination would feed the mic to the speakers; route to
+            // a muted gain node instead so we get callbacks without
+            // creating a feedback loop.
+            const muteSink = micCtx.createGain();
+            muteSink.gain.value = 0;
+            micProcessor.connect(muteSink);
+            muteSink.connect(micCtx.destination);
+
+            micTimer = setInterval(() => {
+                if (!micPendingBuffer) return;
+                const buf = micPendingBuffer;
+                micPendingBuffer = null;
+                processYinFrame(buf, micCtx.sampleRate, getNow(), micSessionGen);
+            }, 50);
+
+            micState = 'listening';
+            try { localStorage.setItem(_LK_STORAGE_KEY, '1'); } catch (_) { /* noop */ }
+            refreshMicUi();
+        } catch (e) {
+            console.warn('lyrics_karaoke mic start failed', e);
+            micErrorMsg = (e && e.message) || 'Microphone unavailable';
+            stopMic({ keepFlag: true });
+            // stopMic resets to 'off'; re-flag as 'error' so the pill/title
+            // surface why the start failed.
+            micState = 'error';
+            refreshMicUi();
+        }
+    }
+
+    function stopMic(opts) {
+        const keepFlag = !!(opts && opts.keepFlag);
+        micSessionGen += 1;  // any in-flight YIN frame becomes stale
+        if (micTimer) { clearInterval(micTimer); micTimer = null; }
+        if (micProcessor) {
+            try { micProcessor.disconnect(); } catch (_) { /* noop */ }
+            micProcessor.onaudioprocess = null;
+            micProcessor = null;
+        }
+        if (micSourceNode) {
+            try { micSourceNode.disconnect(); } catch (_) { /* noop */ }
+            micSourceNode = null;
+        }
+        if (micStream) {
+            try { micStream.getTracks().forEach((t) => t.stop()); } catch (_) { /* noop */ }
+            micStream = null;
+        }
+        if (micCtx) {
+            try { micCtx.close(); } catch (_) { /* noop */ }
+            micCtx = null;
+        }
+        micAccumBuffer = new Float32Array(0);
+        micPendingBuffer = null;
+        if (!keepFlag) {
+            try { localStorage.setItem(_LK_STORAGE_KEY, '0'); } catch (_) { /* noop */ }
+        }
+        micState = 'off';
+        refreshMicUi();
+    }
+
+    function ensureMicButton() {
+        if (micBtn) return;
+        if (!toggleBtn || !toggleBtn.parentNode) return;
+        micBtn = document.createElement('button');
+        micBtn.id = 'btn-karaoke-mic';
+        micBtn.type = 'button';
+        micBtn.disabled = true;
+        micBtn.className = BTN_CLASS_DISABLED;
+        micBtn.textContent = '🎤';
+        micBtn.title = 'Toggle live mic feedback';
+        micBtn.addEventListener('click', onMicClick);
+        toggleBtn.parentNode.insertBefore(micBtn, toggleBtn.nextSibling);
+
+        micPill = document.createElement('span');
+        micPill.id = 'btn-karaoke-mic-pill';
+        micPill.className = 'text-xs text-gray-500 ml-1 inline-block min-w-8 text-center';
+        micPill.textContent = '';
+        toggleBtn.parentNode.insertBefore(micPill, micBtn.nextSibling);
+
+        micBtn.style.display = 'none';
+        micPill.style.display = 'none';
+    }
+
+    async function onMicClick() {
+        if (micBtn && micBtn.disabled) return;
+        if (micState === 'listening') {
+            stopMic({ keepFlag: false });
+            resetUserResults();
+            return;
+        }
+        // 'off' or 'error' — request (or retry) mic acquisition.
+        await startMic();
+    }
+
+    function refreshMicUi() {
+        if (!micBtn) return;
+        const sloppak = isSloppakSong(currentSong);
+        const eligible = sloppak && karaokeMode && !!status && status.has_pitch && songHasMidi();
+        if (!eligible) {
+            micBtn.style.display = 'none';
+            if (micPill) micPill.style.display = 'none';
+            return;
+        }
+        micBtn.style.display = '';
+        if (micPill) micPill.style.display = '';
+
+        switch (micState) {
+            case 'requesting':
+                micBtn.disabled = true;
+                micBtn.className = BTN_CLASS_DISABLED;
+                micBtn.title = 'Requesting microphone…';
+                if (micPill) micPill.textContent = '…';
+                break;
+            case 'listening':
+                micBtn.disabled = false;
+                micBtn.className = BTN_CLASS_ACTIVE;
+                micBtn.title = 'Stop live mic feedback';
+                // Pill text is set by updateMicPill() each render frame.
+                break;
+            case 'error':
+                micBtn.disabled = false;
+                micBtn.className = BTN_CLASS_PROMPT;
+                micBtn.title = 'Mic feedback error: ' + (micErrorMsg || 'unknown') + ' (click to retry)';
+                if (micPill) micPill.textContent = '!';
+                break;
+            default:  // 'off'
+                micBtn.disabled = false;
+                micBtn.className = BTN_CLASS_PROMPT;
+                micBtn.title = 'Toggle live mic feedback';
+                if (micPill) micPill.textContent = '';
+                break;
+        }
+    }
+
+    function updateMicPill() {
+        if (!micPill || micState !== 'listening') return;
+        if (userDisplayMidi == null || !isFinite(userDisplayMidi)) {
+            micPill.textContent = '—';
+            return;
+        }
+        micPill.textContent = midiToName(userDisplayMidi);
+    }
+
     // ── Song lifecycle wiring ──────────────────────────────────────────
 
     function resetForNewSong(song) {
@@ -579,6 +986,11 @@
         // Tear the overlay all the way down so a previous song's bars
         // don't briefly flash for the new song before its data arrives.
         teardownOverlay();
+        // Drop mic state with the song. keepFlag preserves the on/off
+        // intent in localStorage; the user re-clicks to acquire on the
+        // new song (autoplay policies block silent re-acquire anyway).
+        if (micState !== 'off') stopMic({ keepFlag: true });
+        resetUserResults();
         refreshButtonState();
     }
 
@@ -1133,6 +1545,11 @@
                 if (name !== 'player') {
                     if (karaokeMode) setKaraokeMode(false);
                     teardownOverlay();
+                    // setKaraokeMode(false) already stops the mic when
+                    // karaoke was on; this catches the rare case where
+                    // we leave the player while karaoke was already off
+                    // but the mic somehow lingered.
+                    if (micState !== 'off') stopMic({ keepFlag: true });
                 }
                 if (name === 'plugin-lyrics_karaoke') {
                     onSetupScreenShown();
