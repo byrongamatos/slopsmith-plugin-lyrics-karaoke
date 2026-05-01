@@ -653,6 +653,11 @@
     const _LK_STORAGE_KEY = 'lyrics_karaoke.micFeedback';
     const _LK_PITCH_LINE_COLOR = '#22d3ee';
     const _LK_PITCH_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+    // Preallocated YIN working buffer reused across every 50ms detection
+    // frame to avoid per-frame Float32Array allocation / GC churn.
+    // Sized to cover tauMax at 96 kHz / 50 Hz (⌈96000/50⌉ + 1 = 1921 samples); grows
+    // lazily if an even higher sample rate is ever encountered.
+    let _yinWorkBuffer = new Float32Array(2048);
 
     function midiToName(midi) {
         const r = Math.round(midi);
@@ -667,10 +672,18 @@
 
     function yinDetect(buffer, sampleRate, minFreqHz) {
         const threshold = 0.15;
-        const halfLen = Math.floor(buffer.length / 2);
-        const minHalfLenForFreq = Math.ceil(sampleRate / minFreqHz);
-        if (halfLen < minHalfLenForFreq) return { freq: -1, confidence: 0 };
-        const yinBuffer = new Float32Array(halfLen);
+        // tauMax is the lag that corresponds to the lowest pitch we search
+        // for (minFreqHz). Capping halfLen here keeps the outer tau loop and
+        // the inner difference-function loop both bounded by tauMax+1 instead
+        // of buffer.length/2, reducing total work from O(N²) with N=2048 to
+        // O(tauMax²) ≈ 882² at 44100 Hz / 50 Hz min — a ~5.4× speedup.
+        const tauMax = Math.ceil(sampleRate / minFreqHz);
+        const halfLen = Math.min(Math.floor(buffer.length / 2), tauMax + 1);
+        if (halfLen < tauMax) return { freq: -1, confidence: 0 };
+        // Reuse preallocated working buffer; grow only when a higher sample
+        // rate demands more capacity (extremely rare in practice).
+        if (_yinWorkBuffer.length < halfLen) _yinWorkBuffer = new Float32Array(halfLen);
+        const yinBuffer = _yinWorkBuffer;
         let runningSum = 0;
         yinBuffer[0] = 1;
         for (let tau = 1; tau < halfLen; tau++) {
