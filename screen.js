@@ -637,11 +637,10 @@
 
     // ── Mic pitch feedback (live) ──────────────────────────────────────
     //
-    // YIN + getUserMedia + ScriptProcessor accumulator are copied from
-    // plugins/note_detect/screen.js. Vocals are monophonic so YIN alone
-    // is sufficient — no CREPE/HPS/WASM. Keep this in sync with
-    // note_detect when its YIN implementation changes; once a third
-    // consumer arrives, factor into a shared module.
+    // YIN + getUserMedia + ScriptProcessor accumulator are adapted from
+    // the slopsmith note_detect plugin. Vocals are monophonic so YIN alone
+    // is sufficient — no CREPE/HPS/WASM. Once a third consumer of this
+    // pattern arrives, factor into a shared module (tracked as issue #5).
     const _LK_YIN_FRAME_SIZE = 2048;
     const _LK_YIN_MIN_SAMPLES = 4096;
     const _LK_YIN_MIN_HZ = 50;        // human vocal floor — drops sub-bass artefacts
@@ -731,6 +730,7 @@
     let micPendingBuffer = null;      // preallocated snapshot buffer (Float32Array, same size)
     let micPendingReady = false;      // true when pending buffer has a fresh snapshot
     let micPendingBufferAt = -Infinity;  // song-time at the buffer's midpoint
+    let micPendingSession = 0;           // micSessionGen at the time the snapshot was taken
     let micLastCapturedAt = -Infinity;   // previous frame's song-time, for stall/seek detection
     let micErrorMsg = '';
     let micPillLastText = '';            // last text written to micPill; avoids per-frame DOM writes
@@ -936,6 +936,7 @@
                 if (micRingCount >= ringSize) {
                     micPendingBuffer.set(micRingBuffer);
                     micPendingBufferAt = getNow() - midpointWallSec * getPlaybackRate();
+                    micPendingSession = session;
                     micPendingReady = true;
                 }
             };
@@ -953,8 +954,9 @@
             micTimer = setInterval(() => {
                 if (!micPendingReady) return;
                 const at = micPendingBufferAt;
+                const sessionAtCapture = micPendingSession;
                 micPendingReady = false;
-                processYinFrame(micPendingBuffer, sampleRate, at, micSessionGen);
+                processYinFrame(micPendingBuffer, sampleRate, at, sessionAtCapture);
             }, 50);
 
             micState = 'listening';
