@@ -29,6 +29,7 @@
     let currentSong = null;          // {filename, format, ...} from window.slopsmith
     let status = null;               // last /status payload
     let pitchData = null;            // {tokens: [{t, d, w, midi?}, ...]}
+    let tokenIndexMap = new Map();   // tok → index into pitchData.tokens; rebuilt on each load
     let songPitchRange = null;       // {lo, hi} fixed across the song so bars don't shift vertically as the window scrolls
     let karaokeMode = false;         // user toggle
     let savedShowLyrics = true;      // restore on toggle off
@@ -120,6 +121,10 @@
         if (!res.ok) return null;
         pitchData = res.body;
         songPitchRange = computeSongPitchRange(pitchData);
+        tokenIndexMap = new Map();
+        if (pitchData && Array.isArray(pitchData.tokens)) {
+            pitchData.tokens.forEach((tok, i) => { if (tok) tokenIndexMap.set(tok, i); });
+        }
         return pitchData;
     }
 
@@ -560,7 +565,8 @@
         if (userResults.size > 0 || micState === 'listening') {
             for (const { tok, midi } of visible) {
                 if (midi == null) continue;
-                const idx = pitchData.tokens.indexOf(tok);
+                const idx = tokenIndexMap.get(tok);
+                if (idx === undefined) continue;
                 const entry = userResults.get(idx);
                 if (!entry || entry.samplesIn === 0) continue;
                 const acc = entry.accuracy;
@@ -675,7 +681,7 @@
             }
             yinBuffer[tau] = sum;
             runningSum += sum;
-            yinBuffer[tau] *= tau / runningSum;
+            yinBuffer[tau] = runningSum === 0 ? 1 : yinBuffer[tau] * (tau / runningSum);
         }
         let tau = 2;
         while (tau < halfLen) {
@@ -689,7 +695,8 @@
         const s0 = tau > 0 ? yinBuffer[tau - 1] : yinBuffer[tau];
         const s1 = yinBuffer[tau];
         const s2 = tau + 1 < halfLen ? yinBuffer[tau + 1] : yinBuffer[tau];
-        const betterTau = tau + (s0 - s2) / (2 * (s0 - 2 * s1 + s2));
+        const parabDenom = 2 * (s0 - 2 * s1 + s2);
+        const betterTau = parabDenom !== 0 ? tau + (s0 - s2) / parabDenom : tau;
         return {
             freq: sampleRate / betterTau,
             confidence: Math.max(0, 1 - yinBuffer[tau]),
@@ -706,8 +713,10 @@
     let micProcessor = null;
     let micTimer = null;
     let micSessionGen = 0;            // bumped on stop to invalidate stale frames
-    let micAccumBuffer = new Float32Array(0);
-    let micPendingBuffer = null;
+    let micRingBuffer = null;         // preallocated sliding window (Float32Array, _LK_YIN_MIN_SAMPLES)
+    let micRingCount = 0;             // total samples written into ring since mic start
+    let micPendingBuffer = null;      // preallocated snapshot buffer (Float32Array, same size)
+    let micPendingReady = false;      // true when pending buffer has a fresh snapshot
     let micPendingBufferAt = -Infinity;  // song-time at the buffer's midpoint
     let micLastCapturedAt = -Infinity;   // previous frame's song-time, for stall/seek detection
     let micErrorMsg = '';
@@ -722,7 +731,6 @@
     const userPitchSamples = [];      // ring of {t, midi, confidence}
     const userResults = new Map();    // tokenIndex → {samplesIn, samplesMatched, accuracy}
     let userDisplayMidi = null;       // smoothed value used for the pitch line + pill
-    let userLastSampleAt = -Infinity;     // song-time of latest sample (used for token correlation)
     let userLastSampleWallAt = -Infinity; // wall-clock ms of latest sample (used for staleness)
 
     function _wallNow() {
@@ -754,7 +762,6 @@
         userPitchSamples.length = 0;
         userResults.clear();
         userDisplayMidi = null;
-        userLastSampleAt = -Infinity;
         userLastSampleWallAt = -Infinity;
         // Also drop the transport-tracking cursor so the next frame
         // doesn't compare against a stale previous time.
@@ -807,7 +814,6 @@
 
         userPitchSamples.push({ t: capturedAt, midi, confidence: r.confidence });
         if (userPitchSamples.length > _LK_SAMPLE_RING_CAP) userPitchSamples.shift();
-        userLastSampleAt = capturedAt;
         userLastSampleWallAt = _wallNow();
 
         const idx = findActiveTokenIndex(capturedAt);
@@ -873,8 +879,12 @@
             micCtx = pendingCtx;
             micSourceNode = micCtx.createMediaStreamSource(micStream);
             micProcessor = micCtx.createScriptProcessor(_LK_YIN_FRAME_SIZE, 1, 1);
-            micAccumBuffer = new Float32Array(0);
-            micPendingBuffer = null;
+            // Preallocate fixed-size buffers to avoid per-frame Float32Array
+            // allocation / GC pressure in the hot onaudioprocess path.
+            micRingBuffer = new Float32Array(_LK_YIN_MIN_SAMPLES);
+            micPendingBuffer = new Float32Array(_LK_YIN_MIN_SAMPLES);
+            micRingCount = 0;
+            micPendingReady = false;
 
             const sampleRate = micCtx.sampleRate;
             // The captured audio represents the most recent
@@ -893,17 +903,21 @@
             micProcessor.onaudioprocess = (e) => {
                 if (micState !== 'listening') return;
                 const input = e.inputBuffer.getChannelData(0);
-                const prev = micAccumBuffer;
-                const combined = new Float32Array(prev.length + input.length);
-                combined.set(prev);
-                combined.set(input, prev.length);
-                if (combined.length >= _LK_YIN_MIN_SAMPLES) {
-                    const start = combined.length - _LK_YIN_MIN_SAMPLES;
-                    micPendingBuffer = combined.slice(start, start + _LK_YIN_MIN_SAMPLES);
+                const n = input.length;
+                // Slide the ring buffer left by n samples (in-place, no allocation):
+                // copies bytes [n .. _LK_YIN_MIN_SAMPLES-1] to [0 .. _LK_YIN_MIN_SAMPLES-n-1],
+                // then the new frame fills the vacated tail.
+                micRingBuffer.copyWithin(0, n);
+                micRingBuffer.set(input, _LK_YIN_MIN_SAMPLES - n);
+                micRingCount += n;
+                // Only expose a pending snapshot once we have a full window.
+                // After that, every ScriptProcessor callback (~46 ms at
+                // 44100 Hz) produces a fresh snapshot — well within the
+                // 50 ms timer cadence.
+                if (micRingCount >= _LK_YIN_MIN_SAMPLES) {
+                    micPendingBuffer.set(micRingBuffer);
                     micPendingBufferAt = getNow() - midpointWallSec * getPlaybackRate();
-                    micAccumBuffer = new Float32Array(0);
-                } else {
-                    micAccumBuffer = combined;
+                    micPendingReady = true;
                 }
             };
 
@@ -918,11 +932,10 @@
             muteSink.connect(micCtx.destination);
 
             micTimer = setInterval(() => {
-                if (!micPendingBuffer) return;
-                const buf = micPendingBuffer;
+                if (!micPendingReady) return;
                 const at = micPendingBufferAt;
-                micPendingBuffer = null;
-                processYinFrame(buf, sampleRate, at, micSessionGen);
+                micPendingReady = false;
+                processYinFrame(micPendingBuffer, sampleRate, at, micSessionGen);
             }, 50);
 
             micState = 'listening';
@@ -977,8 +990,10 @@
             try { micCtx.close(); } catch (_) { /* noop */ }
             micCtx = null;
         }
-        micAccumBuffer = new Float32Array(0);
+        micRingBuffer = null;
+        micRingCount = 0;
         micPendingBuffer = null;
+        micPendingReady = false;
         micPendingBufferAt = -Infinity;
         micLastCapturedAt = -Infinity;
         if (!keepFlag) {
@@ -1094,6 +1109,7 @@
         currentSong = song || null;
         status = null;
         pitchData = null;
+        tokenIndexMap = new Map();
         songPitchRange = null;
         // Tear the overlay all the way down so a previous song's bars
         // don't briefly flash for the new song before its data arrives.
@@ -1556,6 +1572,7 @@
         await refreshSetupStatus();
         if (currentSong && currentSong.filename === filename) {
             pitchData = null;  // force the player overlay to refetch on toggle
+            tokenIndexMap = new Map();
             await fetchStatus(filename);
             refreshButtonState();
         }
