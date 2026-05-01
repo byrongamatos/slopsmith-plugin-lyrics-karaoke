@@ -1693,7 +1693,7 @@
                     // karaoke was on; this catches the rare case where
                     // we leave the player while karaoke was already off
                     // but the mic somehow lingered.
-                    if (micState !== 'off') stopMic({ keepFlag: true });
+                    if (micState !== 'off') { stopMic({ keepFlag: true }); resetUserResults(); }
                 }
                 if (name === 'plugin-lyrics_karaoke') {
                     onSetupScreenShown();
