@@ -315,15 +315,13 @@
                 }
             }
             showOverlay();
-            // Restore the mic-on intent if the user had it on before
-            // toggling karaoke off (or at page load) for this session.
-            // Fire-and-forget — refreshMicUi reflects the requesting/
-            // listening/error transitions as the promise progresses. If
-            // the gesture context was consumed by an upstream await,
-            // the browser may refuse and the user can re-click 🎤.
-            let wantMic = false;
-            try { wantMic = localStorage.getItem(_LK_STORAGE_KEY) === '1'; } catch (_) { /* noop */ }
-            if (wantMic && status && status.has_pitch && songHasMidi() && micState === 'off') {
+            // Restore the mic-on intent if the user had it on for the
+            // current song's session. Scoped per-song deliberately —
+            // resetForNewSong clears micWantOnForSong, so a one-time
+            // opt-in on song A doesn't auto-prompt on song B.
+            // Fire-and-forget; refreshMicUi reflects the requesting/
+            // listening/error transitions as the promise progresses.
+            if (micWantOnForSong && status && status.has_pitch && songHasMidi() && micState === 'off') {
                 startMic();
             }
         } else {
@@ -713,6 +711,12 @@
     let micPendingBufferAt = -Infinity;  // song-time at the buffer's midpoint
     let micLastCapturedAt = -Infinity;   // previous frame's song-time, for stall/seek detection
     let micErrorMsg = '';
+    // Session-scoped intent: "the user enabled mic for THIS song." Used
+    // to auto-restore the mic when karaoke is toggled off and back on
+    // for the same song without spilling that intent across songs (a
+    // resetForNewSong clears it). The persisted localStorage flag is
+    // separate and serves a future "remember on reload" surface.
+    let micWantOnForSong = false;
 
     // Per-song bookkeeping for the live overlay.
     const userPitchSamples = [];      // ring of {t, midi, confidence}
@@ -851,7 +855,18 @@
             micStream = stream;
             micCtx = new (window.AudioContext || window.webkitAudioContext)();
             if (micCtx.state === 'suspended') {
-                try { await micCtx.resume(); } catch (_) { /* noop */ }
+                // resume() needs a live user gesture; if an upstream
+                // await consumed it (Safari/iOS is the strict case;
+                // the slow toggle path's `await fetchPitchData` can
+                // also lose it), the context stays suspended, no audio
+                // is delivered, and we'd otherwise sit silently in
+                // 'listening'. Treat that as a start failure.
+                try { await micCtx.resume(); } catch (e) {
+                    throw new Error('Audio context could not resume. Click 🎤 again.');
+                }
+                if (micCtx.state === 'suspended') {
+                    throw new Error('Audio context is suspended. Click 🎤 again.');
+                }
             }
             micSourceNode = micCtx.createMediaStreamSource(micStream);
             micProcessor = micCtx.createScriptProcessor(_LK_YIN_FRAME_SIZE, 1, 1);
@@ -908,6 +923,7 @@
             }, 50);
 
             micState = 'listening';
+            micWantOnForSong = true;
             try { localStorage.setItem(_LK_STORAGE_KEY, '1'); } catch (_) { /* noop */ }
             refreshMicUi();
         } catch (e) {
@@ -983,6 +999,10 @@
     async function onMicClick() {
         if (micBtn && micBtn.disabled) return;
         if (micState === 'listening') {
+            // User-initiated stop — clear the per-song intent so karaoke
+            // off/on for this song doesn't auto-resume a mic the user
+            // explicitly turned off.
+            micWantOnForSong = false;
             stopMic({ keepFlag: false });
             resetUserResults();
             return;
@@ -1063,10 +1083,12 @@
         // Tear the overlay all the way down so a previous song's bars
         // don't briefly flash for the new song before its data arrives.
         teardownOverlay();
-        // Drop mic state with the song. keepFlag preserves the on/off
-        // intent in localStorage; the user re-clicks to acquire on the
-        // new song (autoplay policies block silent re-acquire anyway).
+        // Drop mic state with the song. keepFlag preserves the
+        // localStorage on/off bit (a future "remember on reload"
+        // surface), but micWantOnForSong is per-song so a one-time
+        // opt-in on song A doesn't auto-prompt on song B.
         if (micState !== 'off') stopMic({ keepFlag: true });
+        micWantOnForSong = false;
         resetUserResults();
         refreshButtonState();
     }
