@@ -733,6 +733,7 @@
     let micPendingBufferAt = -Infinity;  // song-time at the buffer's midpoint
     let micLastCapturedAt = -Infinity;   // previous frame's song-time, for stall/seek detection
     let micErrorMsg = '';
+    let micPillLastText = '';            // last text written to micPill; avoids per-frame DOM writes
     // Session-scoped intent: "the user enabled mic for THIS song." Used
     // to auto-restore the mic when karaoke is toggled off and back on
     // for the same song without spilling that intent across songs (a
@@ -894,14 +895,19 @@
             micProcessor = micCtx.createScriptProcessor(_LK_YIN_FRAME_SIZE, 1, 1);
             // Preallocate fixed-size buffers to avoid per-frame Float32Array
             // allocation / GC pressure in the hot onaudioprocess path.
-            micRingBuffer = new Float32Array(_LK_YIN_MIN_SAMPLES);
-            micPendingBuffer = new Float32Array(_LK_YIN_MIN_SAMPLES);
+            // ringSize must cover 2*tauMax samples so yinDetect can search
+            // down to _LK_YIN_MIN_HZ at any sample rate (e.g. 192 kHz needs
+            // 2*⌈192000/50⌉ = 7680 samples, well above _LK_YIN_MIN_SAMPLES).
+            const sampleRate = micCtx.sampleRate;
+            const ringSize = Math.max(_LK_YIN_MIN_SAMPLES,
+                2 * Math.ceil(sampleRate / _LK_YIN_MIN_HZ));
+            micRingBuffer = new Float32Array(ringSize);
+            micPendingBuffer = new Float32Array(ringSize);
             micRingCount = 0;
             micPendingReady = false;
 
-            const sampleRate = micCtx.sampleRate;
             // The captured audio represents the most recent
-            // _LK_YIN_MIN_SAMPLES frames of mic input — i.e. it spans
+            // ringSize frames of mic input — i.e. it spans
             // [now - bufferDurationWall, now] in wall-clock seconds.
             // Tag the *midpoint* of that window as the buffer's
             // representative song time so findActiveTokenIndex scores
@@ -911,23 +917,23 @@
             // slow/fast practice still maps frames to the correct
             // syllable (read fresh per frame — the user can scrub the
             // speed slider mid-song).
-            const midpointWallSec = (_LK_YIN_MIN_SAMPLES / 2) / sampleRate;
+            const midpointWallSec = (ringSize / 2) / sampleRate;
 
             micProcessor.onaudioprocess = (e) => {
                 if (micState !== 'listening') return;
                 const input = e.inputBuffer.getChannelData(0);
                 const n = input.length;
                 // Slide the ring buffer left by n samples (in-place, no allocation):
-                // copies bytes [n .. _LK_YIN_MIN_SAMPLES-1] to [0 .. _LK_YIN_MIN_SAMPLES-n-1],
+                // copies bytes [n .. ringSize-1] to [0 .. ringSize-n-1],
                 // then the new frame fills the vacated tail.
                 micRingBuffer.copyWithin(0, n);
-                micRingBuffer.set(input, _LK_YIN_MIN_SAMPLES - n);
+                micRingBuffer.set(input, ringSize - n);
                 micRingCount += n;
                 // Only expose a pending snapshot once we have a full window.
                 // After that, every ScriptProcessor callback (~46 ms at
                 // 44100 Hz) produces a fresh snapshot — well within the
                 // 50 ms timer cadence.
-                if (micRingCount >= _LK_YIN_MIN_SAMPLES) {
+                if (micRingCount >= ringSize) {
                     micPendingBuffer.set(micRingBuffer);
                     micPendingBufferAt = getNow() - midpointWallSec * getPlaybackRate();
                     micPendingReady = true;
@@ -1026,6 +1032,8 @@
         micBtn.className = BTN_CLASS_DISABLED;
         micBtn.textContent = '🎤';
         micBtn.title = 'Toggle live mic feedback';
+        micBtn.setAttribute('aria-label', 'Toggle live mic feedback');
+        micBtn.setAttribute('aria-pressed', 'false');
         micBtn.addEventListener('click', onMicClick);
         toggleBtn.parentNode.insertBefore(micBtn, toggleBtn.nextSibling);
 
@@ -1071,36 +1079,46 @@
                 micBtn.disabled = true;
                 micBtn.className = BTN_CLASS_DISABLED;
                 micBtn.title = 'Requesting microphone…';
-                if (micPill) micPill.textContent = '…';
+                micBtn.setAttribute('aria-label', 'Requesting microphone…');
+                micBtn.setAttribute('aria-pressed', 'false');
+                if (micPill) { micPill.textContent = '…'; micPillLastText = '…'; }
                 break;
             case 'listening':
                 micBtn.disabled = false;
                 micBtn.className = BTN_CLASS_ACTIVE;
                 micBtn.title = 'Stop live mic feedback';
+                micBtn.setAttribute('aria-label', 'Stop live mic feedback');
+                micBtn.setAttribute('aria-pressed', 'true');
+                micPillLastText = '';
                 // Pill text is set by updateMicPill() each render frame.
                 break;
             case 'error':
                 micBtn.disabled = false;
                 micBtn.className = BTN_CLASS_PROMPT;
                 micBtn.title = 'Mic feedback error: ' + (micErrorMsg || 'unknown') + ' (click to retry)';
-                if (micPill) micPill.textContent = '!';
+                micBtn.setAttribute('aria-label', 'Mic error — click to retry');
+                micBtn.setAttribute('aria-pressed', 'false');
+                if (micPill) { micPill.textContent = '!'; micPillLastText = '!'; }
                 break;
             default:  // 'off'
                 micBtn.disabled = false;
                 micBtn.className = BTN_CLASS_PROMPT;
                 micBtn.title = 'Toggle live mic feedback';
-                if (micPill) micPill.textContent = '';
+                micBtn.setAttribute('aria-label', 'Toggle live mic feedback');
+                micBtn.setAttribute('aria-pressed', 'false');
+                if (micPill) { micPill.textContent = ''; micPillLastText = ''; }
                 break;
         }
     }
 
     function updateMicPill() {
         if (!micPill || micState !== 'listening') return;
-        if (userDisplayMidi == null || !isFinite(userDisplayMidi)) {
-            micPill.textContent = '—';
-            return;
-        }
-        micPill.textContent = midiToName(userDisplayMidi);
+        const text = (userDisplayMidi == null || !isFinite(userDisplayMidi))
+            ? '—'
+            : midiToName(userDisplayMidi);
+        if (text === micPillLastText) return;
+        micPillLastText = text;
+        micPill.textContent = text;
     }
 
     // ── Song lifecycle wiring ──────────────────────────────────────────
