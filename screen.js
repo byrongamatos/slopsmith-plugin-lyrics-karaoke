@@ -315,11 +315,22 @@
                 }
             }
             showOverlay();
+            // Restore the mic-on intent if the user had it on before
+            // toggling karaoke off (or at page load) for this session.
+            // Fire-and-forget — refreshMicUi reflects the requesting/
+            // listening/error transitions as the promise progresses. If
+            // the gesture context was consumed by an upstream await,
+            // the browser may refuse and the user can re-click 🎤.
+            let wantMic = false;
+            try { wantMic = localStorage.getItem(_LK_STORAGE_KEY) === '1'; } catch (_) { /* noop */ }
+            if (wantMic && status && status.has_pitch && songHasMidi() && micState === 'off') {
+                startMic();
+            }
         } else {
             hideOverlay();
             // Tear the mic stream down with the overlay — there's nothing
             // to render to. keepFlag preserves the on/off intent so the
-            // next karaoke toggle on the same song respects the choice.
+            // next karaoke toggle on the same song restores the mic.
             if (micState !== 'off') stopMic({ keepFlag: true });
             resetUserResults();
             if (window.highway && typeof window.highway.setLyricsVisible === 'function') {
@@ -564,8 +575,10 @@
                 roundFillRect(ctx, x, y, w, barHeight, BAR_RADIUS * dpr);
             }
 
-            const SAMPLE_FRESH_S = _LK_SAMPLE_FRESH_MS / 1000;
-            const fresh = (now - userLastSampleAt) <= SAMPLE_FRESH_S;
+            // Freshness uses wall-clock ms, not song time — when playback
+            // is paused getNow() stops advancing but the user has stopped
+            // singing live too, so the line/pill should still age out.
+            const fresh = (_wallNow() - userLastSampleWallAt) <= _LK_SAMPLE_FRESH_MS;
             if (fresh && userPitchSamples.length) {
                 const last = userPitchSamples[userPitchSamples.length - 1];
                 if (userDisplayMidi == null) {
@@ -705,7 +718,13 @@
     const userPitchSamples = [];      // ring of {t, midi, confidence}
     const userResults = new Map();    // tokenIndex → {samplesIn, samplesMatched, accuracy}
     let userDisplayMidi = null;       // smoothed value used for the pitch line + pill
-    let userLastSampleAt = -Infinity;
+    let userLastSampleAt = -Infinity;     // song-time of latest sample (used for token correlation)
+    let userLastSampleWallAt = -Infinity; // wall-clock ms of latest sample (used for staleness)
+
+    function _wallNow() {
+        return (typeof performance !== 'undefined' && performance.now)
+            ? performance.now() : Date.now();
+    }
 
     function songHasMidi() {
         if (!pitchData || !Array.isArray(pitchData.tokens)) return false;
@@ -720,6 +739,7 @@
         userResults.clear();
         userDisplayMidi = null;
         userLastSampleAt = -Infinity;
+        userLastSampleWallAt = -Infinity;
         // Also drop the transport-tracking cursor so the next frame
         // doesn't compare against a stale previous time.
         micLastCapturedAt = -Infinity;
@@ -772,6 +792,7 @@
         userPitchSamples.push({ t: capturedAt, midi, confidence: r.confidence });
         if (userPitchSamples.length > _LK_SAMPLE_RING_CAP) userPitchSamples.shift();
         userLastSampleAt = capturedAt;
+        userLastSampleWallAt = _wallNow();
 
         const idx = findActiveTokenIndex(capturedAt);
         if (idx < 0) return;
