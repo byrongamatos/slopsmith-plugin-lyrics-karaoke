@@ -726,6 +726,18 @@
             ? performance.now() : Date.now();
     }
 
+    function getPlaybackRate() {
+        // The player's <audio> element drives song time; its playbackRate
+        // is the song-seconds-per-wall-second ratio. Plugins access it
+        // through the DOM rather than a window global because app.js
+        // keeps the reference module-scoped.
+        const a = (typeof document !== 'undefined') ? document.getElementById('audio') : null;
+        if (a && typeof a.playbackRate === 'number' && a.playbackRate > 0) {
+            return a.playbackRate;
+        }
+        return 1.0;
+    }
+
     function songHasMidi() {
         if (!pitchData || !Array.isArray(pitchData.tokens)) return false;
         for (const t of pitchData.tokens) {
@@ -849,12 +861,16 @@
             const sampleRate = micCtx.sampleRate;
             // The captured audio represents the most recent
             // _LK_YIN_MIN_SAMPLES frames of mic input — i.e. it spans
-            // [now - bufferDuration, now]. Tag the *midpoint* of that
-            // window as the buffer's representative song time so
-            // findActiveTokenIndex scores against the syllable that was
-            // actually being sung, not the one under the cursor by the
-            // time the 50 ms timer happens to wake up.
-            const midpointOffsetSec = (_LK_YIN_MIN_SAMPLES / 2) / sampleRate;
+            // [now - bufferDurationWall, now] in wall-clock seconds.
+            // Tag the *midpoint* of that window as the buffer's
+            // representative song time so findActiveTokenIndex scores
+            // against the syllable actually being sung, not the one
+            // under the cursor when the 50 ms timer wakes. Convert
+            // wall-clock to song-time via the current playback rate so
+            // slow/fast practice still maps frames to the correct
+            // syllable (read fresh per frame — the user can scrub the
+            // speed slider mid-song).
+            const midpointWallSec = (_LK_YIN_MIN_SAMPLES / 2) / sampleRate;
 
             micProcessor.onaudioprocess = (e) => {
                 if (micState !== 'listening') return;
@@ -866,7 +882,7 @@
                 if (combined.length >= _LK_YIN_MIN_SAMPLES) {
                     const start = combined.length - _LK_YIN_MIN_SAMPLES;
                     micPendingBuffer = combined.slice(start, start + _LK_YIN_MIN_SAMPLES);
-                    micPendingBufferAt = getNow() - midpointOffsetSec;
+                    micPendingBufferAt = getNow() - midpointWallSec * getPlaybackRate();
                     micAccumBuffer = new Float32Array(0);
                 } else {
                     micAccumBuffer = combined;
@@ -897,7 +913,11 @@
         } catch (e) {
             console.warn('lyrics_karaoke mic start failed', e);
             micErrorMsg = (e && e.message) || 'Microphone unavailable';
-            stopMic({ keepFlag: true });
+            // Clear the persisted flag on failure. Otherwise a revoked
+            // permission or unplugged input would re-trigger the prompt
+            // on every karaoke toggle. The user can re-click 🎤 to
+            // retry, and a successful start writes the flag back to '1'.
+            stopMic({ keepFlag: false });
             // stopMic resets to 'off'; re-flag as 'error' so the pill/title
             // surface why the start failed.
             micState = 'error';
