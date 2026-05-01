@@ -697,6 +697,8 @@
     let micSessionGen = 0;            // bumped on stop to invalidate stale frames
     let micAccumBuffer = new Float32Array(0);
     let micPendingBuffer = null;
+    let micPendingBufferAt = -Infinity;  // song-time at the buffer's midpoint
+    let micLastCapturedAt = -Infinity;   // previous frame's song-time, for stall/seek detection
     let micErrorMsg = '';
 
     // Per-song bookkeeping for the live overlay.
@@ -718,6 +720,9 @@
         userResults.clear();
         userDisplayMidi = null;
         userLastSampleAt = -Infinity;
+        // Also drop the transport-tracking cursor so the next frame
+        // doesn't compare against a stale previous time.
+        micLastCapturedAt = -Infinity;
     }
 
     function findActiveTokenIndex(time) {
@@ -741,6 +746,23 @@
 
     function processYinFrame(buffer, sampleRate, capturedAt, sessionAtCapture) {
         if (sessionAtCapture !== micSessionGen) return;  // stop happened mid-frame
+
+        // Transport awareness. If the playhead jumped backward (replay,
+        // seek-back), wipe the bookkeeping so old scores don't resurrect
+        // on the new pass. If the playhead didn't advance at all
+        // (paused), drop the sample — otherwise samplesIn for whatever
+        // token sits under the cursor would inflate forever, dragging
+        // accuracy toward 0/1 with no real input.
+        if (micLastCapturedAt > -Infinity) {
+            const delta = capturedAt - micLastCapturedAt;
+            if (delta < 0) {
+                resetUserResults();
+            } else if (delta < 1e-3) {
+                return;
+            }
+        }
+        micLastCapturedAt = capturedAt;
+
         const r = yinDetect(buffer, sampleRate, _LK_YIN_MIN_HZ);
         if (!r || r.freq <= 0 || r.confidence < _LK_YIN_CONFIDENCE) return;
         if (r.freq < _LK_YIN_MIN_HZ || r.freq > _LK_YIN_MAX_HZ) return;
@@ -803,6 +825,16 @@
             micAccumBuffer = new Float32Array(0);
             micPendingBuffer = null;
 
+            const sampleRate = micCtx.sampleRate;
+            // The captured audio represents the most recent
+            // _LK_YIN_MIN_SAMPLES frames of mic input — i.e. it spans
+            // [now - bufferDuration, now]. Tag the *midpoint* of that
+            // window as the buffer's representative song time so
+            // findActiveTokenIndex scores against the syllable that was
+            // actually being sung, not the one under the cursor by the
+            // time the 50 ms timer happens to wake up.
+            const midpointOffsetSec = (_LK_YIN_MIN_SAMPLES / 2) / sampleRate;
+
             micProcessor.onaudioprocess = (e) => {
                 if (micState !== 'listening') return;
                 const input = e.inputBuffer.getChannelData(0);
@@ -813,6 +845,7 @@
                 if (combined.length >= _LK_YIN_MIN_SAMPLES) {
                     const start = combined.length - _LK_YIN_MIN_SAMPLES;
                     micPendingBuffer = combined.slice(start, start + _LK_YIN_MIN_SAMPLES);
+                    micPendingBufferAt = getNow() - midpointOffsetSec;
                     micAccumBuffer = new Float32Array(0);
                 } else {
                     micAccumBuffer = combined;
@@ -832,8 +865,9 @@
             micTimer = setInterval(() => {
                 if (!micPendingBuffer) return;
                 const buf = micPendingBuffer;
+                const at = micPendingBufferAt;
                 micPendingBuffer = null;
-                processYinFrame(buf, micCtx.sampleRate, getNow(), micSessionGen);
+                processYinFrame(buf, sampleRate, at, micSessionGen);
             }, 50);
 
             micState = 'listening';
@@ -873,6 +907,8 @@
         }
         micAccumBuffer = new Float32Array(0);
         micPendingBuffer = null;
+        micPendingBufferAt = -Infinity;
+        micLastCapturedAt = -Infinity;
         if (!keepFlag) {
             try { localStorage.setItem(_LK_STORAGE_KEY, '0'); } catch (_) { /* noop */ }
         }
