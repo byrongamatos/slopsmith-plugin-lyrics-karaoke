@@ -929,10 +929,13 @@
         } catch (e) {
             console.warn('lyrics_karaoke mic start failed', e);
             micErrorMsg = (e && e.message) || 'Microphone unavailable';
-            // Clear the persisted flag on failure. Otherwise a revoked
-            // permission or unplugged input would re-trigger the prompt
-            // on every karaoke toggle. The user can re-click 🎤 to
-            // retry, and a successful start writes the flag back to '1'.
+            // Clear both the persisted flag and the per-song intent on
+            // failure. Otherwise a revoked permission or unplugged
+            // input would re-trigger the prompt on every karaoke
+            // toggle (persisted flag) or every karaoke off/on for the
+            // current song (in-memory intent). The user re-clicks 🎤
+            // to retry; a successful start re-sets both flags.
+            micWantOnForSong = false;
             stopMic({ keepFlag: false });
             // stopMic resets to 'off'; re-flag as 'error' so the pill/title
             // surface why the start failed.
