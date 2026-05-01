@@ -830,6 +830,8 @@
         refreshMicUi();
 
         const session = ++micSessionGen;
+        let pendingStream = null;
+        let pendingCtx = null;
         try {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                 const isHttp = location.protocol === 'http:'
@@ -839,7 +841,21 @@
                     ? 'Microphone access requires HTTPS (or localhost).'
                     : 'Microphone access is not available in this browser. Try Chrome or Edge.');
             }
-            const stream = await navigator.mediaDevices.getUserMedia({
+            // Create + resume the AudioContext BEFORE awaiting
+            // getUserMedia so the original user activation is still
+            // valid when Safari/iOS evaluates resume(). After the
+            // await, activation can be consumed and resume() would
+            // refuse, leaving us silently in 'listening' with no audio.
+            pendingCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (pendingCtx.state === 'suspended') {
+                try { await pendingCtx.resume(); } catch (e) {
+                    throw new Error('Audio context could not resume. Click 🎤 again.');
+                }
+                if (pendingCtx.state === 'suspended') {
+                    throw new Error('Audio context is suspended. Click 🎤 again.');
+                }
+            }
+            pendingStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     echoCancellation: false,
                     noiseSuppression: false,
@@ -849,25 +865,12 @@
             });
             if (session !== micSessionGen) {
                 // Stop happened while the permission prompt was open.
-                stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) { /* noop */ } });
+                pendingStream.getTracks().forEach((t) => { try { t.stop(); } catch (_) { /* noop */ } });
+                try { pendingCtx.close(); } catch (_) { /* noop */ }
                 return;
             }
-            micStream = stream;
-            micCtx = new (window.AudioContext || window.webkitAudioContext)();
-            if (micCtx.state === 'suspended') {
-                // resume() needs a live user gesture; if an upstream
-                // await consumed it (Safari/iOS is the strict case;
-                // the slow toggle path's `await fetchPitchData` can
-                // also lose it), the context stays suspended, no audio
-                // is delivered, and we'd otherwise sit silently in
-                // 'listening'. Treat that as a start failure.
-                try { await micCtx.resume(); } catch (e) {
-                    throw new Error('Audio context could not resume. Click 🎤 again.');
-                }
-                if (micCtx.state === 'suspended') {
-                    throw new Error('Audio context is suspended. Click 🎤 again.');
-                }
-            }
+            micStream = pendingStream;
+            micCtx = pendingCtx;
             micSourceNode = micCtx.createMediaStreamSource(micStream);
             micProcessor = micCtx.createScriptProcessor(_LK_YIN_FRAME_SIZE, 1, 1);
             micAccumBuffer = new Float32Array(0);
@@ -929,6 +932,15 @@
         } catch (e) {
             console.warn('lyrics_karaoke mic start failed', e);
             micErrorMsg = (e && e.message) || 'Microphone unavailable';
+            // Clean up partial state — we may have created the context
+            // and/or stream before the throw, but they aren't yet
+            // assigned to micCtx/micStream that stopMic operates on.
+            if (pendingStream && pendingStream !== micStream) {
+                try { pendingStream.getTracks().forEach((t) => t.stop()); } catch (_) { /* noop */ }
+            }
+            if (pendingCtx && pendingCtx !== micCtx) {
+                try { pendingCtx.close(); } catch (_) { /* noop */ }
+            }
             // Clear both the persisted flag and the per-song intent on
             // failure. Otherwise a revoked permission or unplugged
             // input would re-trigger the prompt on every karaoke
